@@ -1,0 +1,10 @@
+{
+  "tokenizer_class": "Han2HanTokenizer",
+  "model_type": "han2han",
+  "vocab_size": 38400,
+  "pad_token": "<pad>",
+  "unk_token": "<unk>",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "mask_token": "<mask>"
+}

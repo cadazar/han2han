@@ -1,0 +1,79 @@
+# Classifier fine-tuning, local-run variant of classifier_temporal.yaml.
+# Reads task_data from local disk (no data_bucket) and restores the backbone
+# from a local checkpoint. Point model_path at a downloaded Han2Han checkpoint.
+
+
+# model paths
+model_path: checkpoints/han2han-it/checkpoints
+tokenizer_path: han2han_v2_tokenizer
+
+# # for checkpoint averaging
+# average_last_n: 3
+# average_weights: [1, 2, 2]
+# lookahead_alpha: 0.0
+
+# GCS data for pod slice
+# data_bucket unset -> read task_data from local disk
+
+# data config
+data_dir: "task_data"
+task: "temporal"                 # nli, sts, ynat, temporal
+max_encoder_length: 512
+max_decoder_length: 512
+
+# prompting / task prefixes
+use_task_prompts: true
+prompt_language: "ko"
+collator: chat 
+
+# training hyperparameters
+num_epochs: 30
+batch_size: 64
+learning_rate: 2e-4
+warmup_ratio: 0.1
+constant_ratio: 0.0
+lr_schedule: cosine
+min_lr_ratio: 0.1
+clipnorm: 1.0
+gradient_accumulation_steps: 1
+freeze_backbone: false
+remat_policy: null
+
+# optimizer / weight decay settings
+optimizer: muon
+ns_variant: gram
+gram_ns_dtype: bf16
+gram_ns_reset_iters: "2"
+muon_beta: 0.95
+muon_gamma: 0.18
+beta1: 0.90
+beta2: 0.95
+muon_hybrid_ns: false
+muon_adam_wd_ratio: 1.0
+muon_adam_wd_skip_1d: true
+weight_decay: 0.1
+
+# dropout/label smoothing (T5.1.1: only during fine-tuning)
+attndrop: 0.1
+resdrop: 0.1
+embddrop: 0.1
+classf_pdrop: 0.1
+cross_attn_pdrop: 0.1
+classifier_head_type: mlp     # 'linear' (T5Gemma 2) or 'mlp' (T5/RoBERTa-style tanh)
+embedding_dropout_rate: 0.0   # keep module-level dropouts
+layerdrop: 0.0                # off: train everything! 
+label_smoothing: 0.0
+
+# misc
+seed: 42
+dtype: bfloat16
+
+# with task prompts and AdamW at lr=1e-4 AND CLIPNORM: macro_f1 0.7091
+# NO clipnorm: macro_f1=0.7386
+# post-IT:  - task prompts, - clipnorm, adamw 4e-5 wdr 0.01: 0.7595
+#           + task prompts: 
+
+# muongram, base best hparams from STS        : 0.8001
+# post-stage 2 IT model, bs=256, 2e-4         : 0.7856
+# latest post-stage 2 IT checkpoint           : 0.7888
+# latest frozen wje/wce IT checkpoint         : 

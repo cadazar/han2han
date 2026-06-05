@@ -1,0 +1,69 @@
+# Han2Han V1 dependencies.
+#
+# Versions are pinned to the reference environment used for checkpoint
+# conversion, evaluation, and the demo notebooks. TPU pre-training uses the
+# JAX TPU wheels instead of the CPU/GPU jax below; see the README and
+# setup_tpu_host.sh for the pod-slice environment.
+#
+# The Korean Hanja<->Hangul tool is a local Rust extension; install it with
+#   pip install ./han2han_tools
+# (requires a Rust toolchain: https://rustup.rs).
+
+# --- JAX / Flax (Han2Han is trained in Flax; CPU/GPU wheels for local use) ---
+jax==0.10.1
+jaxlib==0.10.1
+flax==0.12.7
+optax==0.2.8
+orbax-checkpoint==0.12.0
+chex>=0.1.91
+etils==1.14.0
+ml_dtypes==0.5.4
+opt-einsum==3.4.0
+
+# --- PyTorch / Hugging Face (HF-loadable checkpoint + conversion) ---
+torch==2.12.0          # CUDA build: --extra-index-url https://download.pytorch.org/whl/cu130 (CPU build also fine for conversion)
+transformers==5.9.0
+safetensors==0.7.0
+tokenizers==0.22.2
+accelerate==1.13.0
+huggingface_hub==1.17.0
+hf-xet==1.5.0
+
+# --- Data pipeline ---
+tensorflow>=2.20       # tf.data / TFDS input pipeline (not in the local conversion env)
+tensorflow-datasets>=4.9
+datasets>=3.0
+pandas==2.3.3
+polars>=1.0
+pyarrow==24.0.0
+gcsfs>=2024.0          # gs:// data buckets
+
+# --- Korean NLP / tokenization ---
+sentencepiece==0.2.1
+konlpy==0.6.0
+mecab-python3==1.0.12
+mecab-ko-dic==1.0.0
+
+# --- Numerics / evaluation ---
+numpy==2.4.6
+scipy==1.16.3
+scikit-learn==1.9.0
+
+# --- Visualization / notebooks (UMAP script-invariance figures + demos) ---
+matplotlib==3.10.9
+plotly==6.7.0
+umap-learn==0.5.12
+ipywidgets==8.1.8
+ipykernel==7.2.0
+nbformat==5.10.4
+jupyter==1.1.1
+
+# --- Utilities ---
+PyYAML==6.0.3
+regex==2026.5.9
+tqdm==4.67.3
+absl-py==2.4.0
+psutil>=6.0
+protobuf==7.35.0
+filelock==3.29.0
+wandb>=0.18

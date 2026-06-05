@@ -1,0 +1,157 @@
+# === PARALLELISM STRATEGY ===
+parallelism_strategy: "data_parallel"
+
+# === MODEL ARCHITECTURE ===
+d_model: 640
+d_ff: 2048
+subword_embed_dim: 384
+encoder_layers: 18
+decoder_layers: 18
+# attention patterns
+attention_mechanism: null # set below
+head_dim: 256
+num_heads: 4
+num_kv_heads: 1
+cross_attn_num_heads: 4
+cross_attn_num_kv_heads: 2
+use_qk_norm: true
+query_pre_attn_scalar: 256
+sliding_window_size: 128
+rope_theta: 500_000
+rope_theta_sliding: 10_000
+no_apply_legacy_rope_quirk: true
+encoder_attention_types:
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha
+decoder_attention_types:
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha-sliding
+  - mha
+decoder_cross_attention_types:
+  - mha
+tie_encoder_decoder: true
+tie_word_embeddings: true
+tie_subtoken_embeddings: false
+tie_input_output_embeddings: true
+ffn_activation: geglu
+model_dtype: bfloat16
+param_dtype: bfloat16
+optimizer_state_dtype: bfloat16
+use_scan_layers: true
+use_bias: true
+init_biases_normal: true
+use_sub_ln: true
+
+# === INITIALIZATION & STABILITY ===
+initializer_range: 0.02
+kernel_init_type: 'variance_scaling'  # variance_scaling, normal
+kernel_init_scale: 0.1
+
+# === SUBWORD FEATURES (Han2Han's core contribution) ===
+jamo_subwords: true
+char_subwords: true
+use_cjk_embeddings: false
+ngram_sizes: "3"
+
+# === DATA PROCESSING ===
+tokenizer_path: han2han_v2_tokenizer
+data_bucket: gs://han2han-europe-west4
+data_source_type: han2han                 # "han2han" (Korean-only data sources)
+sequence_length: 2048
+cooldown_ratio: 0.2                       # using prefixes from the beginning of training: remove 20% before finishing
+use_phase2_collator: true
+training_phase: 2
+prompt_language: ko                       # for task prefixes, in which language to give the prompt
+mode_ratios: 0.4,0.4,0.2                  # denoising, denoising_heavy, continuation
+infilling_ratio: 0.15,0.15,0.30           # R-denoiser (token-based): pairs infilling_ratio[i] with poisson_lambda field 1[i]
+poisson_lambda: 3,8,3;3,8,64,64           # [(3, 0.15), (8, 0.15), (3, 0.30)], [(3, 0.5), (8, 0.5), (64, 0.15), (64, 0.5)]
+heavy_infilling_ratio: 0.5,0.5,0.15,0.5   # X-denoiser (heavy): pairs heavy_infilling_ratio[i] with poisson_lambda field 2[i]
+morpheme_lambda: 2,3,2                    # morpheme: pairs infilling_ratio[i] with morpheme_lambda[i]. [(2, 0.15), (3, 0.15), (2, 0.30)]
+sentence_permutation: false               # BART sentence shuffling
+morpheme_denoising_ratio: 0.7             # when denoising, use morpheme-based span masking this % of the time
+sentinel_denoising_ratio: 1.0             # use sentinel-based span masking this % of the time (BART the other %)
+han2han_transcription_ratio: 0.6          # how often to transcribe hanja-containing sequences to hangul for script-aware denoising
+temporal_continuation_ratio: 0.1          # has to actually have the 'year' column—this will work out to ~5% of examples
+byte_reconstruction_ratio: 0.1            # 20% of heavy denoising -> byte reconstruction
+sft_tasks: none                           # options: translation,sts,ynat,nli,temporal_classification,ocr_correction, all, none
+enable_packing: true
+packing_efficiency_threshold: 0.9
+collator_buffer_size: 1000                # buffer this many examples for each data source
+packed_buffer_size: 256
+training_mode: full                       # debug/sweep/full
+disable_budget_limit: false               # use full data slices without budget truncation
+force_reload: false                       # ignore/overwrite the dataset cache
+
+# === OPTIMIZATION ===
+optimizer: muon                   # muon
+ns_variant: gram                  # standard | gram
+gram_ns_dtype: bf16               # bf16 | fp16 | fp32 (gram only)
+gram_ns_reset_iters: "2"          # gram-only
+muon_beta: 0.95
+beta1: 0.90
+beta2: 0.95
+clipnorm: 1.0
+muon_hybrid_ns: false
+muon_gamma: 0.18
+muon_adam_wd_ratio: 1.0
+muon_adam_wd_skip_1d: true
+# learning rate settings
+lr_schedule: constant
+learning_rate: 2.66e-4
+batch_size: 128
+gradient_accumulation_steps: 1    # (2048sl*128bs*16workers*1acc*1.15corruption) ~=4.8M tok/update
+lr_cooldown_ratio: 0.2
+lr_cooldown_type: sqrt
+min_lr_ratio: 0.0001
+warmup_ratio: 0.1
+constant_ratio: 0.7
+max_tokens: 35_000_000_000
+# weight decay settings
+weight_decay: 0.1
+
+# === TRAINING HYPERPARAMETERS ===
+remat_policy: full
+label_smoothing: 0.0
+embedding_dropout_rate: 0.0
+layerdrop: 0.0
+cross_attn_pdrop: 0.0
+resdrop: 0.0
+attndrop: 0.0
+embddrop: 0.0
+
+# === CHECKPOINTING & EVALUATION ===
+output_dir: output_han2han_v2
+gcs_output_dir: gs://han2han-europe-west4/han2han-ul2-base-1/pt_ropeFix
+# restore_step: 1349               # use once, commented out for later auto-restarts
+disable_mnlu_probe: true
+disable_generative_eval: true
+mc_eval_benchmarks: kmmlu,click,haerae
+mc_eval_max_samples: 500
+temporal_eval_benchmarks: temporal_ko
+temporal_eval_max_samples: 500
+save_ratio: 0.01428571429         # save every 1B tokens
+eval_ratio: 0.2                   # evaluate every 7B tokens
+eval_split_ratio: 0.05
+eval_batch_size: 32               # batch size for evaluation
+eval_max_batches: 50
+logging_steps: 50                 # log/report loss/train metrics every X (micro-)steps
+keep_checkpoints: 10
+
+# === WANDB LOGGING ===
+wandb_project: han2han-ul2-base
+wandb_entity: cellikadams
+wandb_run_name: base-1-MuonGram-150B-LR_2.66e-4-725stepWarmup-immediateDecay-ropeFix
+wandb_online: true
+
+# === SYSTEM ===
+seed: 42                          # random seed
+smoke_test: false                 # real training
+skip_restore: false               # (dis)allow checkpoint resumption
+eval_clear_caches: true

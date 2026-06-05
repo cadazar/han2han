@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.so
+_harvest/
+output_*/
+*.egg-info/
+.ipynb_checkpoints/
+wandb/
+task_data_cache/
+task_data/

@@ -1,0 +1,120 @@
+# SFT Fine-tuning Config: Transcription with chat-template formatting.
+# Mirrors sft_transcription.yaml but routes through ChatSFTCollator
+# (<|system|>, <|user|>, <|assistant|>, <|end_of_turn|>, <|think|> boundaries).
+# Requires a tokenizer regenerated with <|think|> via
+# han2han_v2_tokenizer/prepare_multilingual_tokenizer.py.
+
+# parallelism
+parallelism_strategy: data_parallel
+
+# model paths
+model_path: gs://han2han-europe-west4/han2han-ul2-base-1/pt_ropeFix/to_150b/checkpoints
+tokenizer_path: han2han_v2_tokenizer
+output_dir: gs://han2han-europe-west4/han2han-ul2-base-1/IT_CoT_stage_1-frozen_wje_wce-150B-CL_SS
+
+# for checkpoint averaging
+# average_last_n: 5
+average_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+lookahead_alpha: 0.0
+average_steps: [25037, 26089, 26950, 28001, 28766]
+
+# data config
+data_dir: task_data
+data_bucket: gs://han2han-europe-west4
+sft_tasks: instruction_following,cot_reasoning,transcription_articles,summarization
+sft_sampling_strategy: capped
+sft_sampling_cap_multiplier: 10.0
+max_encoder_length: 2048
+max_decoder_length: 2048
+enable_packing: true
+packing_efficiency_threshold: 0.9
+packed_buffer_size: 32
+
+# training hyperparameters
+max_tokens: 2_000_000_000
+batch_size: 8
+learning_rate: 2.66e-5
+warmup_ratio: 0.1
+constant_ratio: 0.7
+lr_schedule: constant
+lr_cooldown_ratio: 0.2
+lr_cooldown_type: sqrt
+min_lr_ratio: 0.01
+gradient_accumulation_steps: 2
+remat_policy: none
+freeze_pretrained_params: wje,wce
+freeze_embeddings: null
+
+# quantization
+subword_proj_precision: bf16
+dense_ffn_precision: bf16
+attention_proj_precision: bf16
+
+# optimizer
+optimizer: muon
+ns_variant: gram
+gram_ns_dtype: bf16
+gram_ns_reset_iters: "2"
+muon_beta: 0.95
+beta1: 0.90
+beta2: 0.95
+clipnorm: 1.0
+muon_hybrid_ns: false
+muon_adam_wd_ratio: 0.1
+muon_adam_wd_skip_1d: true
+muon_gamma: 0.18
+weight_decay: 0.01
+embedding_weight_decay: 0.01
+lm_head_weight_decay: 0.01
+mlp_weight_decay: 0.01
+norm_weight_decay: 0.01
+bias_weight_decay: 0.01
+
+# scheduled sampling
+use_scheduled_sampling: true
+ss_temperature: 1.0
+ss_mixing_method: gumbel
+ss_decisions_from_train_pass: false
+ss_differentiable_two_pass: false
+ss_threshold_mode: fixed
+
+# contrastive learning
+use_contrastive_learning: true
+cl_weight: 0.1
+cl_margin: 0.01
+cl_temperature: 1.0
+
+# evaluation / saving
+eval_every_tokens: 200_000_000
+save_every_tokens: 50_000_000
+skip_restore: false
+restore_step: null
+save_best_metric: null
+save_best_mode: max
+eval_batch_size: 32
+max_eval_samples: 1000
+eval_tasks: ""
+eval_with_cot: false
+
+# dropout/label smoothing
+label_smoothing: 0.05
+attndrop: 0.05
+resdrop: 0.05
+embddrop: 0.05
+cross_attn_pdrop: 0.05
+embedding_dropout_rate: 0.0
+layerdrop: 0.05
+
+# prompts (these become the <|system|> content under the chat collator)
+use_task_prompts: true
+prompt_language: ko
+collator: chat
+
+# misc
+seed: 42
+dtype: bfloat16
+
+# wandb
+use_wandb: true
+wandb_project: han2han-sft
+wandb_run_name: IT-CoT-stage_1-frozenWjeWce-CLSS-150B

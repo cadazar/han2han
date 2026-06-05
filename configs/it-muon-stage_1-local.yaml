@@ -1,0 +1,118 @@
+# SFT stage 1 (instruction + CoT), local-run variant of it-muon-stage_1.yaml.
+# Routes through ChatSFTCollator (<|system|>, <|user|>, <|assistant|>,
+# <|end_of_turn|>, <|think|> boundaries) and reads data + checkpoints from
+# local disk rather than GCS.
+#
+# To run locally:
+#   1. Download the pretrained Han2Han base checkpoint and point model_path at it.
+#   2. Place the SFT task parquets under data_dir (see task_data/ layout).
+#   3. python finetune_sft.py --config configs/it-muon-stage_1-local.yaml
+
+# parallelism
+parallelism_strategy: "data_parallel"
+
+# model paths (local). model_path is the pretrained base checkpoint to fine-tune.
+model_path: checkpoints/han2han-base/checkpoints
+tokenizer_path: han2han_v2_tokenizer
+output_dir: checkpoints/han2han-it-stage_1
+
+# checkpoint averaging across the last N pretraining checkpoints. comment out to
+# fine-tune from a single latest checkpoint instead.
+# average_last_n: 20
+lookahead_alpha: 0.0
+
+# data config (local files under data_dir; no data_bucket -> local path)
+data_dir: task_data
+sft_tasks: instruction_following,cot_reasoning
+sft_sampling_strategy: capped
+sft_sampling_cap_multiplier: 3.0
+max_encoder_length: 1024
+max_decoder_length: 1024
+enable_packing: true
+packing_efficiency_threshold: 0.9
+packed_buffer_size: 16
+
+# chat-template collator
+collator: chat
+
+# training hyperparameters
+max_tokens: 1_000_000_000
+batch_size: 2
+learning_rate: 4e-5
+warmup_ratio: 0.0
+constant_ratio: 0.8
+lr_schedule: constant
+lr_cooldown_ratio: 0.2
+lr_cooldown_type: sqrt
+min_lr_ratio: 0.01
+gradient_accumulation_steps: 16
+remat_policy: none
+freeze_pretrained_params: false
+freeze_embeddings: null
+
+# precision (dense bf16)
+subword_proj_precision: bf16
+dense_ffn_precision: bf16
+attention_proj_precision: bf16
+
+# optimizer
+optimizer: normuon
+ns_variant: gram
+gram_ns_dtype: bf16
+gram_ns_reset_iters: "2"
+muon_beta: 0.95
+normuon_beta2: 0.95
+normuon_eps: 1.0e-10
+beta1: 0.90
+beta2: 0.95
+clipnorm: 1.0
+muon_hybrid_ns: false
+muon_adam_wd_ratio: 1.0
+muon_adam_wd_skip_1d: true
+weight_decay: 0.1
+
+# scheduled sampling
+use_scheduled_sampling: false
+ss_temperature: 1.0
+ss_mixing_method: gumbel
+ss_decisions_from_train_pass: true
+ss_differentiable_two_pass: true
+
+# contrastive learning
+use_contrastive_learning: false
+cl_weight: 5.0
+cl_margin: 0.01
+cl_temperature: 1.0
+
+# evaluation / saving
+eval_every_tokens: 250_000_000
+save_every_tokens: 250_000_000
+skip_restore: true
+restore_step: null
+save_best_metric: null
+save_best_mode: max
+eval_batch_size: 8
+max_eval_samples: 100
+eval_tasks: temporal,sts,nli,ynat
+eval_with_cot: true
+
+# dropout/label smoothing
+attndrop: 0.05
+resdrop: 0.05
+embedding_dropout_rate: 0.0
+layerdrop: 0.0
+cross_attn_pdrop: 0.05
+label_smoothing: 0.05
+
+# prompts (these become the <|system|> content under the chat collator)
+use_task_prompts: true
+prompt_language: ko
+
+# misc
+seed: 42
+dtype: bfloat16
+
+# wandb
+use_wandb: true
+wandb_project: han2han-sft
+wandb_run_name: IT-CoT-stage_1-local
