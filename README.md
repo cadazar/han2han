@@ -42,22 +42,34 @@ versus 131B-6.3T tokens for the KLUE baselines.
 | SKT-KoBART-base-v1 | 86.0 | 71.7 | 77.6 |
 | **Han2Han (169M)** | 84.5 | 84.4 | 74.7 |
 
-Han2Han matches or approaches the baselines on YNAT and STS despite the far
-smaller training budget. NLI is the weakest dimension, consistent with a
-pre-training mixture that deliberately prioritizes script-invariance and
-morpheme structure over premise-hypothesis reasoning.
+Han2Han matches or approaches the baselines on YNAT despite the far smaller
+training budget. On STS the reading depends on the split: the 84.4 above is the
+KorSTS **dev** score and sits mid-range among the baselines, but on the held-out
+KorSTS **test** split under a matched fine-tuning loss the Korean-native encoders
+lead every Han2Han model (85.9 for the strongest, against 75.1 here), so we make
+no parity claim on contemporary STS. NLI is the weakest dimension, consistent
+with a pre-training mixture that deliberately prioritizes script-invariance and
+morpheme structure over premise-hypothesis reasoning. Han2Han's claims live on
+script-invariance and historical text, where the ordering reverses.
 
 **Temporal classification** of mixed-script historical newspapers, evaluated on
 *Hangul-only* inputs (the script cues are stripped, so the task tests transfer
-across the script gap):
+across the script gap), on an **article-level held-out test split** whose
+articles are excluded from pre-training by URL:
 
-| Model              | Macro-F1 |
-| ------------------ | -------- |
-| KLUE-BERT          | 61.0     |
-| KLUE-RoBERTa-base  | 55.0     |
-| **Han2Han (169M)** | **80.0** |
+| Model              | Params | Test macro-F1 |
+| ------------------ | ------ | ------------- |
+| **Han2Han**        | 169M   | **76.0**      |
+| T5Gemma 2          | 786M   | 54.3          |
+| KLUE-BERT          | 110M   | 54.3          |
+| SKT-KoBART-base-v1 | 124M   | 53.6          |
+| KLUE-RoBERTa-base  | 110M   | 50.9          |
+| KoELECTRA-base-v3  | 110M   | 49.4          |
+| XLM-RoBERTa-base   | 270M   | 47.5          |
 
-A **+19.0-point** improvement over KLUE-BERT.
+A **+21.7-point** margin over the strongest baselines. Each baseline received its
+own optimizer and learning-rate sweep; every Han2Han model shares a single
+fine-tuning recipe tuned once.
 
 **Document-level script-invariance** on 1,124 hand-transcribed art-criticism
 articles (CASASIA, 1920s-1940s); **k-NN** is bidirectional 1-NN cross-script
@@ -213,17 +225,24 @@ gcloud alpha compute tpus tpu-vm ssh TPU_NAME --zone=ZONE \
 | `launch_*_host.sh`                     | host-based TPU launch scripts                      |
 | `setup_tpu_host.sh`                    | TPU pod-slice environment provisioning             |
 
+## Reproducibility: held-out evaluation
+
+The temporal-classification results above use an article-level held-out split whose articles
+are excluded from pre-training by URL at the data loader. The split builder, the exclusion
+registry, the loader acceptance test, and a disclosure about the released checkpoint's residual
+exposure are in [`reproducibility/`](reproducibility/).
+
 ## Citation
 
-The paper is under review. A BibTeX entry will be added on acceptance:
+To appear in Findings of the Association for Computational Linguistics: EMNLP 2026.
 
 ```bibtex
-@misc{han2han2026,
-  title  = {Han2Han: Efficient Language-Specific Character Representation
-            through Script-Aware Pre-Training for Historical Text Analysis},
-  author = {Adams, Cellik and Jo, Eunkyoung and Kim, Ju-ae},
-  year   = {2026},
-  note   = {Under review}
+@inproceedings{han2han2026,
+  title     = {Han2Han: Efficient Language-Specific Character Representation
+               through Script-Aware Pre-Training for Historical Text Analysis},
+  author    = {Adams, Cellik and Jo, Eunkyoung and Kim, Ju-ae},
+  booktitle = {Findings of the Association for Computational Linguistics: EMNLP 2026},
+  year      = {2026}
 }
 ```
 
