@@ -3,6 +3,9 @@
 **Efficient language-specific character representation through script-aware pre-training for historical Korean text.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+![EMNLP 2026 Findings](https://img.shields.io/badge/EMNLP%202026-Findings-b31b1b.svg)
+
+Accepted to **Findings of the Association for Computational Linguistics: EMNLP 2026** ([citation](#citation)).
 
 Han2Han is a 169M-parameter encoder-decoder model that learns **script-invariant**
 Korean representations: it places a document written in Hanja (Sino-Korean
@@ -26,28 +29,27 @@ not emerge from scale alone. Han2Han instead teaches the correspondence directly
 through its pre-training objective, and the resulting etymological knowledge
 transfers even when script cues are removed.
 
-## Headline results
+## Results
 
 All numbers are from the paper. Han2Han is trained from scratch on **35B tokens**,
 versus 131B-6.3T tokens for the KLUE baselines.
 
-**KLUE benchmark** (YNAT macro-F1 %, STS Spearman x100, NLI accuracy %):
+**KLUE benchmark** (YNAT macro-F1 %, KLUE dev; STS Spearman x100, KorSTS
+dev/test under a matched fine-tuning loss; NLI accuracy %, KLUE dev):
 
-| Model              | YNAT | STS  | NLI  |
-| ------------------ | ---- | ---- | ---- |
-| XLM-RoBERTa-base   | 80.6 | 92.6 | 75.2 |
-| KLUE-BERT          | 84.9 | 94.2 | 80.3 |
-| KLUE-RoBERTa-base  | 84.1 | 93.8 | 83.7 |
-| KoELECTRA-base-v3  | 83.5 | 82.6 | 85.4 |
-| SKT-KoBART-base-v1 | 86.0 | 71.7 | 77.6 |
-| **Han2Han (169M)** | 84.5 | 84.4 | 74.7 |
+| Model              | YNAT | STS (dev) | STS (test) | NLI  |
+| ------------------ | ---- | --------- | ---------- | ---- |
+| XLM-RoBERTa-base   | 80.6 | 81.7      | 79.0       | 75.2 |
+| KLUE-BERT          | 84.9 | 87.7      | 82.5       | 80.3 |
+| KLUE-RoBERTa-base  | 84.1 | 86.8      | 84.2       | 83.7 |
+| KoELECTRA-base-v3  | 83.5 | 88.1      | 85.9       | 85.4 |
+| SKT-KoBART-base-v1 | 86.0 | 84.9      | 81.4       | 77.6 |
+| **Han2Han (169M)** | 84.5 | 84.4      | 75.1       | 74.7 |
 
 Han2Han matches or approaches the baselines on YNAT despite the far smaller
-training budget. On STS the reading depends on the split: the 84.4 above is the
-KorSTS **dev** score and sits mid-range among the baselines, but on the held-out
-KorSTS **test** split under a matched fine-tuning loss the Korean-native encoders
-lead every Han2Han model (85.9 for the strongest, against 75.1 here), so we make
-no parity claim on contemporary STS. NLI is the weakest dimension, consistent
+training budget. On STS the dev score sits mid-range among the baselines, but on
+the held-out test split the Korean-native encoders lead every Han2Han model, so
+no parity claim is made on contemporary STS. NLI is the weakest dimension, consistent
 with a pre-training mixture that deliberately prioritizes script-invariance and
 morpheme structure over premise-hypothesis reasoning. Han2Han's claims live on
 script-invariance and historical text, where the ordering reverses.
@@ -79,13 +81,13 @@ itself):
 | Model                       | Params | Cos  | k-NN |
 | --------------------------- | ------ | ---- | ---- |
 | T5Gemma 2                   | 786M   | 0.84 | 0.03 |
-| T5Gemma 2 + Han2Han recipe (FT) | 786M | 0.97 | 0.57 |
+| T5Gemma 2 + Han2Han recipe | 786M | 0.97 | 0.57 |
 | **Han2Han (ours)**          | 169M   | 0.84 | **0.61** |
 
 Han2Han 169M trained from scratch slightly exceeds the 4.7x-larger T5Gemma 2 +
 recipe on the rank-based k-NN metric, on 1/57 the pre-training tokens. The recipe
-is portable (it lifts T5Gemma 2 out of total script segregation), and Han2Han's
-architecture is what makes that invariance accessible at small scale. At the
+is portable (it lifts T5Gemma 2 out of total script segregation), and the
+architecture contributes alongside it, delivering the invariance at small scale. At the
 lexical level, Han2Han reaches **0.87** centered top-1 Hanja->Hangul cognate
 retrieval -- matched only by T5Gemma 2 + recipe (0.86), while 1.2-1.5B
 decoder-only Korean LMs remain at or below 0.41.
