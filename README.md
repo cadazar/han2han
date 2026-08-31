@@ -242,7 +242,7 @@ To appear in Findings of the Association for Computational Linguistics: EMNLP 20
 @inproceedings{han2han2026,
   title     = {Han2Han: Efficient Language-Specific Character Representation
                through Script-Aware Pre-Training for Historical Text Analysis},
-  author    = {Adams, Cellik and Jo, Eunkyoung and Kim, Ju-ae},
+  author    = {Adams, Cellik and Jo, EunKyoung and Kim, Juae},
   booktitle = {Findings of the Association for Computational Linguistics: EMNLP 2026},
   year      = {2026}
 }
