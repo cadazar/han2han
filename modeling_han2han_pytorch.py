@@ -1035,8 +1035,13 @@ class Han2HanPreTrainedModel(PreTrainedModel):
         import os
         from safetensors import safe_open
 
-        # Load model normally
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        # Load model normally. With output_loading_info=True the base class
+        # returns (model, loading_info) instead of the model.
+        loaded = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        if isinstance(loaded, tuple):
+            model, loading_info = loaded
+        else:
+            model, loading_info = loaded, None
 
         # get base model (handles both Han2Han and Han2HanForXXX classes)
         base_model = model.model if hasattr(model, 'model') else model
@@ -1063,6 +1068,8 @@ class Han2HanPreTrainedModel(PreTrainedModel):
                     if "decoder.cbu" in f.keys() and not hasattr(base_model.decoder, 'cbu'):
                         base_model.decoder.register_buffer('cbu', f.get_tensor("decoder.cbu"))
 
+        if loading_info is not None:
+            return model, loading_info
         return model
 
     def set_subword_tables(self, jbu=None, cbu=None):
