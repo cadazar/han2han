@@ -181,7 +181,10 @@ python compare_ppl_flax_torch.py --flax_ckpt /path/to/flax/checkpoints \
     --pt_dir converted/han2han-base --data corpus.parquet --n 32 --max_length 256
 ```
 
-Pre-trained weights will be released on the Hugging Face Hub.
+The instruction-tuned checkpoint is on the Hugging Face Hub as
+[`cadazar/han2han-it`](https://huggingface.co/cadazar/han2han-it). It loads
+through the `transformers` Auto classes with `trust_remote_code=True`; see the
+model card for a usage snippet.
 
 ## Demos
 
