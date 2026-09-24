@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Dict
 
@@ -11,6 +12,7 @@ from torch.nn import functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import (
     ModelOutput,
     QuestionAnsweringModelOutput,
@@ -33,7 +35,11 @@ def _import_fla_modules():
     global RotaryEmbedding, GatedMLP, FLARMSNorm
     if RotaryEmbedding is not None:
         return
-    from fla.modules import RotaryEmbedding as _Rotary, GatedMLP as _Gated, RMSNorm as _RMSNorm
+    # try block keeps transformers' remote-code import check from requiring fla
+    try:
+        from fla.modules import RotaryEmbedding as _Rotary, GatedMLP as _Gated, RMSNorm as _RMSNorm
+    except ImportError:
+        raise
     RotaryEmbedding = _Rotary
     GatedMLP = _Gated
     FLARMSNorm = _RMSNorm
@@ -439,112 +445,107 @@ class Han2HanAttention(nn.Module):
         attention_mask: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        init_cache: bool = False,
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        past_key_values: Optional[EncoderDecoderCache] = None,
+        layer_idx: Optional[int] = None,
+        q_offset: int = 0,
+    ) -> torch.Tensor:
+        """Dense (optionally sliding-window) GQA attention.
 
-        # standard self / cross-attention.
-        if self.is_cross_attention and encoder_hidden_states is not None:
-            Q = self.query(hidden_states)
-            K = self.key(encoder_hidden_states)
-            V = self.value(encoder_hidden_states)
+        `past_key_values` is the decoder's `EncoderDecoderCache`. Self-attention appends
+        the new keys/values (RoPE and QK-norm already applied) to its `self_attention_cache`
+        layer; cross-attention projects the encoder states once and reuses them from
+        `cross_attention_cache` on later steps. `q_offset` is the number of decoder
+        positions already in the cache, i.e. the absolute position of the first query.
+        """
+        is_cross = self.is_cross_attention and encoder_hidden_states is not None
+        if past_key_values is not None and layer_idx is None:
+            raise ValueError("layer_idx is required when past_key_values is given")
+
+        B, Tq, _ = hidden_states.shape
+        q = self.query(hidden_states).view(B, Tq, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+        if is_cross:
             mask = encoder_attention_mask
+            if past_key_values is not None and past_key_values.is_updated.get(layer_idx):
+                cached = past_key_values.cross_attention_cache.layers[layer_idx]
+                k, v = cached.keys, cached.values
+            else:
+                Tenc = encoder_hidden_states.shape[1]
+                k = self.key(encoder_hidden_states).view(B, Tenc, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+                v = self.value(encoder_hidden_states).view(B, Tenc, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+                if self.k_norm is not None:
+                    k = self.k_norm(k)
+                if past_key_values is not None:
+                    k, v = past_key_values.cross_attention_cache.update(k, v, layer_idx)
+                    past_key_values.is_updated[layer_idx] = True
+            if self.q_norm is not None:
+                q = self.q_norm(q)
         else:
-            Q = self.query(hidden_states)
-            K = self.key(hidden_states)
-            V = self.value(hidden_states)
             mask = attention_mask
+            k = self.key(hidden_states).view(B, Tq, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+            v = self.value(hidden_states).view(B, Tq, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
 
-        B, Tq, _ = Q.shape
-        Tkv = K.shape[1]
-
-        # KV cache: concatenate past with new (unrotated; RoPE is applied per-step
-        # below using kv_len-relative positions).
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            K = torch.cat([past_k, K], dim=1)
-            V = torch.cat([past_v, V], dim=1)
-            Tkv = K.shape[1]
-
-        # legacy tuple-cache contract: present holds the FULL concatenated K/V
-        # so BlockCollection can stash it as past_key_values[layer_idx] for the
-        # next step. Migration to HF EncoderDecoderCache (which would have us
-        # return only new tokens here and let the cache class concat) is deferred
-        # to a follow-up PR -- see plan A.5.
-        use_cache_out = init_cache or (past_key_value is not None)
-        present = (K, V) if use_cache_out else None
-
-        causal = self.is_causal and not self.is_cross_attention
-
-        if 'mha' in self.attention_mechanism:
-            # Reshape: Q gets num_heads; K/V get num_kv_heads (GQA-friendly).
-            q = Q.view(B, Tq, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-            k = K.view(B, Tkv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-            v = V.view(B, Tkv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-
-            # Apply RoPE per-head AFTER reshape (matches Flax 1141-1179). For cache
-            # scenarios Q's positions live at [kv_len-q_len : kv_len], not [0 : q_len].
-            if not self.is_cross_attention:
-                cos, sin = self._build_rope_cache(Tkv, q.device, q.dtype)
-                cos = cos.to(q.dtype)
-                sin = sin.to(q.dtype)
-                # q is (B, num_heads, Tq, head_dim); transpose to (B, Tq, num_heads, head_dim)
-                # for apply_rotary_embedding_simple, then transpose back.
-                q_seq = q.permute(0, 2, 1, 3).contiguous()
-                k_seq = k.permute(0, 2, 1, 3).contiguous()
-                q_seq = apply_rotary_embedding_simple(q_seq, cos[Tkv - Tq:Tkv], sin[Tkv - Tq:Tkv])
-                k_seq = apply_rotary_embedding_simple(k_seq, cos[:Tkv], sin[:Tkv])
-                q = q_seq.permute(0, 2, 1, 3).contiguous()
-                k = k_seq.permute(0, 2, 1, 3).contiguous()
-
-            # Post-RoPE QK-norm (Gemma 3 / T5Gemma 2 order). RMSNorm normalizes the
-            # last axis (head_dim) and broadcasts across the head axis.
+            # RoPE per head at absolute positions [q_offset, q_offset + Tq) (matches Flax
+            # 1141-1179), then post-RoPE QK-norm (Gemma 3 / T5Gemma 2 order). Both are
+            # per-position, so caching the rotated, normalized keys is exact.
+            cos, sin = self._build_rope_cache(q_offset + Tq, q.device, q.dtype)
+            cos = cos[q_offset:].to(q.dtype)
+            sin = sin[q_offset:].to(q.dtype)
+            # apply_rotary_embedding_simple takes (B, T, heads, head_dim)
+            q = apply_rotary_embedding_simple(q.permute(0, 2, 1, 3).contiguous(), cos, sin).permute(0, 2, 1, 3).contiguous()
+            k = apply_rotary_embedding_simple(k.permute(0, 2, 1, 3).contiguous(), cos, sin).permute(0, 2, 1, 3).contiguous()
             if self.q_norm is not None:
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
 
-            # 4D attention mask matching Flax modeling_han2han_flax.py:1097-1138 +
-            # sliding-window when self.is_sliding (modeling_han2han_flax.py:683-704).
-            attn_mask = self._build_4d_mask(mask, B, Tq, Tkv, causal, q.device)
+            if past_key_values is not None:
+                k, v = past_key_values.self_attention_cache.update(k, v, layer_idx)
 
-            # When the mask already encodes causal structure (cache scenario or 4D
-            # input), do not double-apply via SDPA's is_causal flag. Sliding windows
-            # always require the explicit mask path.
-            sdpa_is_causal = causal and attn_mask is None
+        Tkv = k.shape[2]
+        causal = self.is_causal and not is_cross
 
-            # Convert bool mask to additive float mask using finfo.min, matching
-            # Flax `jnp.where(mask, logits, finfo.min)`. SDPA with a bool mask
-            # fills False positions with -inf, so a fully-masked row produces
-            # softmax(-inf, ...) = NaN. finfo.min is finite, so an all-masked row
-            # softmaxes to a uniform distribution (finite output).
-            if attn_mask is not None and attn_mask.dtype == torch.bool:
-                additive = torch.zeros((), dtype=q.dtype, device=q.device).expand_as(attn_mask).clone()
-                additive.masked_fill_(~attn_mask, torch.finfo(q.dtype).min)
-                attn_mask = additive
+        # 4D attention mask matching Flax modeling_han2han_flax.py:1097-1138 +
+        # sliding-window when self.is_sliding (modeling_han2han_flax.py:683-704).
+        attn_mask = self._build_4d_mask(mask, B, Tq, Tkv, causal, q.device, q_offset=q_offset)
 
-            dropout_p = self.attn_dropout.p if self.training else 0.0
-            sdpa_kwargs = dict(
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=sdpa_is_causal,
-            )
-            if self.num_heads != self.num_kv_heads:
-                # Manual GQA broadcast via repeat_interleave. SDPA's enable_gqa
-                # kernel produced ~0.15 max_abs encoder drift vs Flax at fp32
-                # because of a slightly different reduction order; explicit
-                # repeat keeps the matmul order identical to Flax's GQA einsum
-                # (`BTKGH,BSKH->BTKGS`) at the cost of K/V memory.
-                repeat = self.num_heads // self.num_kv_heads
-                k_e = k.repeat_interleave(repeat, dim=1)
-                v_e = v.repeat_interleave(repeat, dim=1)
-                attn_output = F.scaled_dot_product_attention(q, k_e, v_e, **sdpa_kwargs)
-            else:
-                attn_output = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+        # When the mask already encodes causal structure (cache scenario or 4D
+        # input), do not double-apply via SDPA's is_causal flag. Sliding windows
+        # always require the explicit mask path.
+        sdpa_is_causal = causal and attn_mask is None
 
-            # (B, num_heads, Tq, head_dim) -> (B, Tq, q_proj_dim)
-            attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, Tq, self.q_proj_dim)
+        # Convert bool mask to additive float mask using finfo.min, matching
+        # Flax `jnp.where(mask, logits, finfo.min)`. SDPA with a bool mask
+        # fills False positions with -inf, so a fully-masked row produces
+        # softmax(-inf, ...) = NaN. finfo.min is finite, so an all-masked row
+        # softmaxes to a uniform distribution (finite output).
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            additive = torch.zeros((), dtype=q.dtype, device=q.device).expand_as(attn_mask).clone()
+            additive.masked_fill_(~attn_mask, torch.finfo(q.dtype).min)
+            attn_mask = additive
+
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        sdpa_kwargs = dict(
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=sdpa_is_causal,
+        )
+        if self.num_heads != self.num_kv_heads:
+            # Manual GQA broadcast via repeat_interleave. SDPA's enable_gqa
+            # kernel produced ~0.15 max_abs encoder drift vs Flax at fp32
+            # because of a slightly different reduction order; explicit
+            # repeat keeps the matmul order identical to Flax's GQA einsum
+            # (`BTKGH,BSKH->BTKGS`) at the cost of K/V memory.
+            repeat = self.num_heads // self.num_kv_heads
+            k_e = k.repeat_interleave(repeat, dim=1)
+            v_e = v.repeat_interleave(repeat, dim=1)
+            attn_output = F.scaled_dot_product_attention(q, k_e, v_e, **sdpa_kwargs)
+        else:
+            attn_output = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+
+        # (B, num_heads, Tq, head_dim) -> (B, Tq, q_proj_dim)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, Tq, self.q_proj_dim)
 
         # SubLN: normalize over q_proj_dim before the output projection.
         # Matches modeling_han2han_flax.py:1259-1261.
@@ -553,7 +554,7 @@ class Han2HanAttention(nn.Module):
         attn_output = self.c_proj(attn_output)
         attn_output = self.attn_dropout(attn_output)
 
-        return attn_output, present
+        return attn_output
 
     def _build_4d_mask(
         self,
@@ -563,10 +564,15 @@ class Han2HanAttention(nn.Module):
         Tkv: int,
         causal: bool,
         device: torch.device,
+        q_offset: int = 0,
     ) -> Optional[torch.Tensor]:
         """Builds a (B, 1, Tq, Tkv) boolean mask combining padding + causal +
         sliding-window. Returns None when no mask is needed (no padding, no
         windowing, and SDPA's `is_causal` flag can cover the causal case).
+
+        `q_offset` is the absolute decoder position of the first query; only the
+        cross-attention window needs it, since for self-attention it always equals
+        Tkv - Tq.
 
         Mirrors modeling_han2han_flax.py:1097-1138 for padding/causal and
         modeling_han2han_flax.py:683-704 / 752-762 for the sliding-window
@@ -586,7 +592,7 @@ class Han2HanAttention(nn.Module):
             # is symmetric per Flax _build_splash_mask cross branch.
             window_mask = None
             if W > 0:
-                q_idx = torch.arange(Tq, device=device)[None, None, :, None]
+                q_idx = torch.arange(q_offset, q_offset + Tq, device=device)[None, None, :, None]
                 kv_idx = torch.arange(Tkv, device=device)[None, None, None, :]
                 diff = q_idx - kv_idx
                 window_mask = (diff > -W) & (diff < W)  # (1, 1, Tq, Tkv)
@@ -812,21 +818,23 @@ class Han2HanBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        init_cache: bool = False,
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        past_key_values: Optional[EncoderDecoderCache] = None,
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        # decoder positions already cached for this layer, read before self-attention appends to it
+        q_offset = past_key_values.self_attention_cache.get_seq_length(layer_idx) if past_key_values is not None else 0
+
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
 
-        attn_output, present = self.attn(
+        attn_output = self.attn(
             hidden_states,
             attention_mask,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            init_cache,
-            output_attentions,
-            past_key_value,
+            output_attentions=output_attentions,
+            past_key_values=past_key_values,
+            layer_idx=layer_idx,
+            q_offset=q_offset,
         )
         hidden_states = attn_output + residual
 
@@ -834,14 +842,15 @@ class Han2HanBlock(nn.Module):
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
 
-            cross_attn_output, _ = self.crossattention(
+            cross_attn_output = self.crossattention(
                 hidden_states,
                 attention_mask,
                 encoder_hidden_states,
                 encoder_attention_mask,
-                init_cache,
-                output_attentions,
-                past_key_value=None, # no caching for cross attn
+                output_attentions=output_attentions,
+                past_key_values=past_key_values,
+                layer_idx=layer_idx,
+                q_offset=q_offset,
             )
             if self.ca_gate is not None:
                 cross_attn_output = self.ca_gate * cross_attn_output
@@ -854,7 +863,7 @@ class Han2HanBlock(nn.Module):
         feed_forward_hidden_states = self.mlp(hidden_states)
         hidden_states = residual + feed_forward_hidden_states
 
-        return hidden_states, present
+        return hidden_states
 
 
 class Han2HanBlockCollection(nn.Module):
@@ -902,17 +911,14 @@ class Han2HanBlockCollection(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        past_key_values: Optional[Tuple] = None,
+        past_key_values: Optional[EncoderDecoderCache] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         all_hidden_states = () if output_hidden_states else None
         all_attentions = None
         all_cross_attentions = None
-        init_cache = use_cache and (past_key_values is None)
-        presents = () if use_cache else None
 
         for layer_idx, layer in enumerate(self.layers):
             if output_hidden_states:
@@ -928,30 +934,25 @@ class Han2HanBlockCollection(nn.Module):
                     if torch.rand(1).item() < self.layerdrop:
                         continue
 
-            layer_past = past_key_values[layer_idx] if past_key_values is not None else None
-
-            hidden_states, present = layer(
+            hidden_states = layer(
                 hidden_states,
                 attention_mask,
                 encoder_hidden_states,
                 encoder_attention_mask,
-                init_cache,
-                output_attentions,
-                past_key_value=layer_past,
+                output_attentions=output_attentions,
+                past_key_values=past_key_values,
+                layer_idx=layer_idx,
             )
-
-            if present is not None:
-                presents += (present,)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in (hidden_states, presents, all_hidden_states, all_attentions, all_cross_attentions) if v is not None)
+            return tuple(v for v in (hidden_states, past_key_values, all_hidden_states, all_attentions, all_cross_attentions) if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=presents if presents else None,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states if output_hidden_states else None,
             attentions=all_attentions,
             cross_attentions=all_cross_attentions
@@ -1001,12 +1002,6 @@ class Han2HanPreTrainedModel(PreTrainedModel):
             tied["lm_head.weight"] = "decoder.wte.weight"
 
         if getattr(self.config, 'tie_encoder_decoder', False):
-            if (getattr(self.config, 'tie_encoder_decoder_experts_only', False)
-                    or getattr(self.config, 'tie_encoder_decoder_except_experts', False)):
-                raise NotImplementedError(
-                    "tie_encoder_decoder_experts_only / tie_encoder_decoder_except_experts "
-                    "are MoE-only and deferred until the MoE PyTorch port lands."
-                )
             n = min(self.config.encoder_nlayer, self.config.decoder_nlayer)
             for i in range(n):
                 base_enc = f"encoder.h.layers.{i}"
@@ -1051,10 +1046,25 @@ class Han2HanPreTrainedModel(PreTrainedModel):
             # Find the safetensors file
             if os.path.isdir(pretrained_model_name_or_path):
                 safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
-            else:
+            elif os.path.exists(pretrained_model_name_or_path):
                 safetensors_path = pretrained_model_name_or_path
+            else:
+                # hub repo id: resolve the weights file through the hf cache
+                from transformers.utils import cached_file
 
-            if os.path.exists(safetensors_path):
+                hub_kwargs = {
+                    key: kwargs[key]
+                    for key in ("cache_dir", "force_download", "proxies", "token", "revision",
+                                "local_files_only", "subfolder")
+                    if key in kwargs
+                }
+                safetensors_path = cached_file(
+                    pretrained_model_name_or_path, "model.safetensors", **hub_kwargs,
+                    _raise_exceptions_for_missing_entries=False,
+                    _raise_exceptions_for_connection_errors=False,
+                )
+
+            if safetensors_path is not None and os.path.exists(safetensors_path):
                 with safe_open(safetensors_path, framework="pt") as f:
                     # Load encoder buffers
                     if "encoder.jbu" in f.keys() and not hasattr(base_model.encoder, 'jbu'):
@@ -1386,11 +1396,19 @@ class Han2HanModule(Han2HanPreTrainedModel):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         use_cache: bool = False,
-        past_key_values: Optional[Tuple] = None,
+        past_key_values: Optional[EncoderDecoderCache] = None,
         return_dict: bool = True,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        if past_key_values is None:
-            past_key_values = tuple([None] * (self.config.encoder_nlayer if self.is_encoder else self.config.decoder_nlayer))
+        # use_cache is kept for the positional signature; caching happens whenever a
+        # cache object is passed, and Han2Han.forward decides when to create one
+        if past_key_values is not None:
+            if self.is_encoder:
+                raise ValueError("the encoder does not take a KV cache")
+            if not isinstance(past_key_values, EncoderDecoderCache):
+                raise TypeError(
+                    f"past_key_values must be an EncoderDecoderCache, got {type(past_key_values).__name__}; "
+                    "tuple caches are no longer supported"
+                )
 
         if attention_mask is None and input_ids is not None:
             attention_mask = input_ids.ne(self.config.pad_token_id)
@@ -1473,11 +1491,10 @@ class Han2HanModule(Han2HanPreTrainedModel):
             attention_mask,
             encoder_hidden_states,
             encoder_attention_mask,
-            use_cache,
-            output_attentions,
-            output_hidden_states,
-            return_dict,
-            past_key_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            past_key_values=past_key_values,
         )
 
         if not return_dict:
@@ -1514,14 +1531,6 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
 
     def __init__(self, config: Han2HanConfig, char_buckets=None, jamo_buckets=None):
         super().__init__(config)
-
-        # this port supports the dense bf16 MHA path only; raise loudly rather than
-        # silently dropping into unsupported configurations.
-        if getattr(config, 'encoder_num_sparse', 0) > 0 or getattr(config, 'decoder_num_sparse', 0) > 0:
-            raise NotImplementedError(
-                "sparse (MoE) layers are not supported; this model is dense FFN only. "
-                "Set encoder_num_sparse=decoder_num_sparse=0."
-            )
 
         self.gradient_checkpointing = None
 
@@ -1582,8 +1591,7 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
 
     def _tie_encoder_decoder_blocks(self):
         """Tie encoder/decoder attention QKV/output kernels and dense MLP
-        kernels per matching layer pair. Dense-only; MoE tying is deferred
-        until the MoE PyTorch port lands.
+        kernels per matching layer pair.
 
         Mirrors modeling_han2han_flax.py:3210-3370 (_tie_encoder_decoder_blocks
         and _tie_block_pair). NEVER tied: biases, all RMSNorm scales
@@ -1591,13 +1599,6 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
         subword_proj, ln_emb, cross-attention (encoder has none anyway).
         See memory/pytorch_subword_proj_tying_bug.md.
         """
-        if (getattr(self.config, 'tie_encoder_decoder_experts_only', False)
-                or getattr(self.config, 'tie_encoder_decoder_except_experts', False)):
-            raise NotImplementedError(
-                "tie_encoder_decoder_experts_only / tie_encoder_decoder_except_experts "
-                "are MoE-only and deferred until the MoE PyTorch port lands."
-            )
-
         enc_layers = self.encoder.h.layers
         dec_layers = self.decoder.h.layers
         n = min(len(enc_layers), len(dec_layers))
@@ -1708,7 +1709,7 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
         encoder_outputs: Optional[Union[Tuple, BaseModelOutputWithPastAttentionsAndSentenceEmbeddings]] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple] = None,
+        past_key_values: Optional[EncoderDecoderCache] = None,
         use_cache: Optional[bool] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -1718,6 +1719,8 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
 
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if use_cache and past_key_values is None:
+            past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
 
         # handle encoder_outputs - if provided from HF's generate(), use them directly
         if encoder_outputs is None:
@@ -1744,8 +1747,8 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
                 encoder_attention_mask,
                 output_attentions,
                 output_hidden_states,
-                use_cache,
-                past_key_values,
+                False,  # use_cache: the encoder is never cached
+                None,  # past_key_values
                 return_dict,
             )
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutputWithPastAttentionsAndSentenceEmbeddings):
@@ -1833,7 +1836,7 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
                 logits=lm_logits,
                 hidden_states=hidden_states,
                 sentence_embeddings=sentence_embeddings if not self.config.use_bart_training else None,
-                past_key_values=encoder_outputs.past_key_values,
+                past_key_values=past_key_values if use_cache else None,
                 decoder_hidden_states=decoder_outputs.hidden_states,
                 decoder_attentions=decoder_outputs.attentions,
                 cross_attentions=decoder_outputs.cross_attentions,
@@ -1847,7 +1850,7 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
 
             return BaseModelOutputWithPastAttentionsAndSentenceEmbeddings(
                 last_hidden_state=encoder_outputs.last_hidden_state,
-                past_key_values=encoder_outputs.past_key_values,
+                past_key_values=None,
                 sentence_embeddings=sentence_embeddings if not self.config.use_bart_training else None,
                 hidden_states=encoder_outputs.hidden_states,
                 attentions=encoder_outputs.attentions
@@ -1858,7 +1861,7 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
 
             return Seq2SeqModelOutput(
                 last_hidden_state = hidden_states,
-                past_key_values = decoder_outputs.past_key_values,
+                past_key_values = past_key_values if use_cache else None,
                 decoder_hidden_states = decoder_outputs.hidden_states,
                 decoder_attentions = decoder_outputs.attentions,
                 cross_attentions = decoder_outputs.cross_attentions,
@@ -1867,783 +1870,21 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
                 encoder_attentions=encoder_outputs.attentions,
             )
 
-    def prepare_inputs_for_generation(
-        self,
-        decoder_input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        encoder_outputs=None,
-        decoder_attention_mask=None,
-        **kwargs
-    ):
-        """Prepare inputs for generation compatible with HF's generate."""
-        # trim decoder_input_ids if past is used
-        if past_key_values is not None:
-            decoder_input_ids = decoder_input_ids[:, -1:]
+    def generate(self, *args, **kwargs):
+        """Standard `transformers` generation (`GenerationMixin.generate`) with a KV cache.
 
-        # handle decoder_attention_mask
-        if decoder_attention_mask is None and decoder_input_ids is not None:
-            decoder_attention_mask = decoder_input_ids.ne(self.config.pad_token_id).long()
-
-        return {
-            "input_ids": None,  # encoder_outputs is defined, input_ids not needed
-            "encoder_outputs": encoder_outputs,
-            "past_key_values": past_key_values,
-            "decoder_input_ids": decoder_input_ids,
-            "attention_mask": attention_mask,
-            "decoder_attention_mask": decoder_attention_mask,
-            "use_cache": kwargs.get("use_cache")
-        }
-
-    def _reorder_cache(self, past_key_values, beam_idx):
-        """Reorder past key values for beam search."""
-        reordered_past = ()
-        for layer_past in past_key_values:
-            # cached cross_attention states don't need reordering for beam search
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),
-            )
-        return reordered_past
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        decoder_input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_length: Optional[int] = None,
-        max_new_tokens: Optional[int] = None,
-        min_length: Optional[int] = None,
-        do_sample: bool = False,
-        early_stopping: bool = True,
-        num_beams: int = 1,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 1.0,
-        repetition_penalty: float = 1.0,
-        bos_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        length_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-        num_return_sequences: int = 1,
-        decoder_start_token_id: Optional[int] = None,
-        use_cache: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        use_fixed_length_generation: bool = True,
-        **model_kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        `use_fixed_length_generation` belonged to an earlier custom decoding loop; it is
+        accepted with a FutureWarning and ignored.
         """
-        Generate sequences using the Han2Han model with proper KV caching.
-
-        Supports greedy decoding, beam search, and nucleus/top-k sampling.
-        Integrates with Han2Han's encoder-decoder architecture and KV caching.
-
-        Args:
-            input_ids: input token ids for the encoder
-            decoder_input_ids: optional initial decoder token ids to use as a prompt
-            attention_mask: attention mask for encoder inputs
-            max_length: maximum length of generated sequences
-            max_new_tokens: maximum number of new tokens to generate
-            min_length: minimum length of generated sequences
-            do_sample: whether to use sampling instead of greedy decoding
-            early_stopping: whether to stop beam search when num_beams sentences are finished
-            num_beams: number of beams for beam search
-            temperature: temperature for sampling
-            top_k: number of top tokens to consider for top-k sampling
-            top_p: cumulative probability for nucleus sampling
-            repetition_penalty: penalty for repeated tokens
-            bad_words_ids: list of token ids that should not be generated
-            force_words_ids: list of token ids that must be generated
-            bos_token_id: beginning of sentence token id
-            pad_token_id: padding token id
-            eos_token_id: end of sentence token id
-            length_penalty: exponential penalty to the length for beam search
-            no_repeat_ngram_size: size of n-grams that should not be repeated
-            encoder_no_repeat_ngram_size: size of encoder n-grams that should not be repeated
-            num_return_sequences: number of sequences to return
-            decoder_start_token_id: token id to start decoding with
-            use_cache: whether to use kv caching
-            use_fixed_length_generation: maintain fixed-length sequences during generation (matches training)
-            **model_kwargs: additional model arguments
-
-        Returns:
-            generated token sequences
-        """
-        # set default token ids from config
-        bos_token_id = bos_token_id if bos_token_id is not None else getattr(self.config, 'bos_token_id', None)
-        eos_token_id = eos_token_id if eos_token_id is not None else getattr(self.config, 'eos_token_id', None)
-        pad_token_id = pad_token_id if pad_token_id is not None else getattr(self.config, 'pad_token_id', None)
-        decoder_start_token_id = decoder_start_token_id if decoder_start_token_id is not None else getattr(self.config, 'decoder_start_token_id', bos_token_id)
-
-        # set default length constraints
-        if max_length is None and max_new_tokens is None:
-            max_length = getattr(self.config, 'max_length', 512)
-        elif max_new_tokens is not None:
-            # max_new_tokens specifies additional tokens beyond prompt
-            # we need to add prompt length to get total max_length
-            if decoder_input_ids is not None:
-                prompt_length = decoder_input_ids.shape[-1]
-            else:
-                prompt_length = 1  # just the start token
-            max_length = prompt_length + max_new_tokens
-
-        min_length = min_length if min_length is not None else getattr(self.config, 'min_length', 0)
-
-        batch_size = input_ids.shape[0]
-        device = input_ids.device
-
-        # handle fixed-length generation if enabled
-        if use_fixed_length_generation:
-            # pad encoder inputs to max_length to match training
-            current_length = input_ids.shape[1]
-            if current_length < max_length:
-                # pad input_ids to max_length
-                padding_length = max_length - current_length
-                padding = torch.full((batch_size, padding_length), pad_token_id, dtype=input_ids.dtype, device=device)
-                input_ids = torch.cat([input_ids, padding], dim=1)
-
-                # update attention mask accordingly
-                if attention_mask is not None:
-                    mask_padding = torch.zeros((batch_size, padding_length), dtype=attention_mask.dtype, device=device)
-                    attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
-
-        # fixed-length generation and kv caching are incompatible
-        # fixed-length passes full sequences while cache expects single tokens
-        if use_fixed_length_generation and use_cache:
-            use_cache = False
-
-        # prepare attention mask
-        if attention_mask is None:
-            attention_mask = input_ids.ne(pad_token_id) if pad_token_id is not None else torch.ones_like(input_ids)
-
-        # handle jamo/char embeddings
-        encoder_jamo_input_ids = None
-        encoder_char_input_ids = None
-        if self.config.jamo_subwords and hasattr(self.encoder, "jbu") and self.encoder.jbu is not None:
-            encoder_jamo_input_ids = self.encoder.jbu[input_ids].long()
-        if self.config.char_subwords and hasattr(self.encoder, "cbu") and self.encoder.cbu is not None:
-            encoder_char_input_ids = self.encoder.cbu[input_ids].long()
-
-        # encode inputs only once
-        encoder_outputs = self.encoder(
-            input_ids,
-            encoder_jamo_input_ids,
-            encoder_char_input_ids,
-            attention_mask,
-            None,  # encoder_hidden_states
-            None,  # encoder_attention_mask
-            output_attentions,
-            output_hidden_states,
-            False,  # use_cache
-            None,  # past_key_values
-            True,  # return_dict
-        )
-
-        # prepare encoder outputs for decoder
-        encoder_hidden_states = encoder_outputs.last_hidden_state
-
-        # handle different training modes (bart vs tsdae)
-        if not self.config.use_bart_training:
-            # for tsdae mode, use sentence embeddings
-            input_mask = attention_mask.float()
-            input_mask_expanded = input_mask.unsqueeze(-1)
-            sum_embeddings = (encoder_hidden_states * input_mask_expanded).sum(dim=1)
-            sum_mask = input_mask_expanded.sum(dim=1)
-            sum_mask = torch.clamp(sum_mask, min=1e-9)
-            sentence_embeddings = sum_embeddings / sum_mask
-            encoder_hidden_states = sentence_embeddings[:, None, :]
-            encoder_attention_mask = torch.ones(batch_size, 1, device=device)
-        else:
-            # for bart mode, use full sequences
-            encoder_attention_mask = attention_mask
-
-        # initialize decoder input
-        if decoder_start_token_id is None:
-            raise ValueError("decoder_start_token_id must be specified for generation")
-
-        # Route to appropriate generation method based on parameters
-        if num_beams > 1:
-            # Use beam search generation
-            return self._beam_search_generate(
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                decoder_start_token_id=decoder_start_token_id,
-                decoder_input_ids=decoder_input_ids,
-                max_length=max_length,
-                min_length=min_length,
-                num_beams=num_beams,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                length_penalty=length_penalty,
-                early_stopping=early_stopping,
-                num_return_sequences=num_return_sequences,
-                batch_size=batch_size,
-                device=device,
-                use_cache=use_cache,
-                use_fixed_length_generation=use_fixed_length_generation,
+        if "use_fixed_length_generation" in kwargs:
+            kwargs.pop("use_fixed_length_generation")
+            warnings.warn(
+                "use_fixed_length_generation is ignored: Han2Han now uses the standard transformers "
+                "generate() with a KV cache. Remove the argument; a future release will reject it.",
+                FutureWarning,
+                stacklevel=2,
             )
-        else:
-            # Use greedy or sampling generation with KV caching
-            return self._generate_with_cache(
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                decoder_start_token_id=decoder_start_token_id,
-                decoder_input_ids=decoder_input_ids,
-                max_length=max_length,
-                min_length=min_length,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                batch_size=batch_size,
-                device=device,
-                use_cache=use_cache,
-                use_fixed_length_generation=use_fixed_length_generation,
-            )
-
-    def _generate_with_cache(
-        self,
-        encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        decoder_start_token_id: int,
-        decoder_input_ids: Optional[torch.Tensor],
-        max_length: int,
-        min_length: int,
-        do_sample: bool,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        repetition_penalty: float,
-        no_repeat_ngram_size: int,
-        eos_token_id: Optional[int],
-        pad_token_id: Optional[int],
-        batch_size: int,
-        device: torch.device,
-        use_cache: bool = True,
-        use_fixed_length_generation: bool = False,
-    ) -> torch.Tensor:
-        """Generation with proper KV caching for efficiency."""
-        # initialize decoder input - use provided prompt or start token
-        if decoder_input_ids is not None:
-            # use provided decoder prompt
-            decoder_tokens = decoder_input_ids.to(device)
-            if decoder_tokens.dim() == 1:
-                decoder_tokens = decoder_tokens.unsqueeze(0)
-            # expand to batch size if needed
-            if decoder_tokens.shape[0] == 1 and batch_size > 1:
-                decoder_tokens = decoder_tokens.expand(batch_size, -1)
-        else:
-            # use single start token
-            decoder_tokens = torch.full((batch_size, 1), decoder_start_token_id, device=device, dtype=torch.long)
-
-        # track finished sequences
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        # Initialize KV cache
-        past_key_values = None
-
-        # determine initial prompt length for proper loop handling
-        initial_length = decoder_tokens.shape[1]
-
-        # determine buffer size for fixed-length generation
-        if use_fixed_length_generation:
-            # when using fixed-length generation, the buffer must be exactly max_length
-            buffer_size = max_length
-        else:
-            buffer_size = max_length  # for standard generation, just use max_length
-
-        # if we already have a prompt, we need to initialize cache with it first
-        if initial_length > 1 and use_cache and not use_fixed_length_generation:
-            # initialize cache with the full prompt except the last token
-            prompt_tokens = decoder_tokens[:, :-1]
-
-            # Compute jamo/char input_ids for prompt if needed
-            prompt_jamo_input_ids = None
-            prompt_char_input_ids = None
-            if self.config.jamo_subwords and hasattr(self.decoder, "jbu") and self.decoder.jbu is not None:
-                prompt_jamo_input_ids = self.decoder.jbu[prompt_tokens].long()
-            if self.config.char_subwords and hasattr(self.decoder, "cbu") and self.decoder.cbu is not None:
-                prompt_char_input_ids = self.decoder.cbu[prompt_tokens].long()
-
-            # run decoder on prompt to build cache
-            attention_mask_prompt = torch.ones_like(prompt_tokens)
-            outputs = self.decoder(
-                input_ids=prompt_tokens,
-                jamo_input_ids=prompt_jamo_input_ids,
-                char_input_ids=prompt_char_input_ids,
-                attention_mask=attention_mask_prompt,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                past_key_values=None,
-                use_cache=use_cache,
-                return_dict=True,
-            )
-            past_key_values = outputs.past_key_values
-
-        for step in range(max_length - initial_length):
-            current_length = decoder_tokens.shape[1]
-
-            # Prepare input for this step based on generation mode
-            if use_fixed_length_generation:
-                # when using fixed-length generation, always pass the full buffer
-                # this maintains encoder-decoder length alignment
-                # pad decoder tokens to buffer size
-                if current_length < buffer_size:
-                    padding_length = buffer_size - current_length
-                    padding = torch.full((batch_size, padding_length), pad_token_id, dtype=decoder_tokens.dtype, device=device)
-                    input_ids_step = torch.cat([decoder_tokens, padding], dim=1)
-                else:
-                    input_ids_step = decoder_tokens[:, :buffer_size]
-                # create attention mask for valid positions only
-                positions = torch.arange(buffer_size, device=device).unsqueeze(0)
-                decoder_attention_mask = (positions < current_length).long()
-            elif past_key_values is not None and use_cache:
-                # Only use the last generated token when we have cached KV pairs
-                input_ids_step = decoder_tokens[:, -1:]
-                decoder_attention_mask = torch.ones_like(input_ids_step)
-            else:
-                # Use full sequence for first step or non-cached generation
-                input_ids_step = decoder_tokens
-                decoder_attention_mask = decoder_tokens.ne(pad_token_id) if pad_token_id is not None else torch.ones_like(decoder_tokens)
-
-            # Compute jamo/char input_ids if needed
-            decoder_jamo_input_ids = None
-            decoder_char_input_ids = None
-            if self.config.jamo_subwords and hasattr(self.decoder, "jbu") and self.decoder.jbu is not None:
-                decoder_jamo_input_ids = self.decoder.jbu[input_ids_step].long()
-            if self.config.char_subwords and hasattr(self.decoder, "cbu") and self.decoder.cbu is not None:
-                decoder_char_input_ids = self.decoder.cbu[input_ids_step].long()
-
-            # forward pass with KV caching
-            outputs = self.decoder(
-                input_ids=input_ids_step,
-                jamo_input_ids=decoder_jamo_input_ids,
-                char_input_ids=decoder_char_input_ids,
-                attention_mask=decoder_attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                return_dict=True,
-            )
-
-            # Update KV cache for next iteration
-            if use_cache:
-                past_key_values = outputs.past_key_values
-
-            # get logits for next token prediction
-            hidden_states = outputs.last_hidden_state
-            next_token_logits = self.lm_head(hidden_states[:, -1, :])
-
-            # apply repetition penalty
-            if repetition_penalty != 1.0:
-                next_token_logits = self._apply_repetition_penalty(
-                    next_token_logits, decoder_tokens, repetition_penalty
-                )
-
-            # apply no_repeat_ngram constraint
-            if no_repeat_ngram_size > 0 and current_length > no_repeat_ngram_size:
-                next_token_logits = self._apply_no_repeat_ngram(
-                    next_token_logits, decoder_tokens, no_repeat_ngram_size, current_length
-                )
-
-            # apply min_length constraint
-            if current_length < min_length and eos_token_id is not None:
-                next_token_logits[:, eos_token_id] = -float('inf')
-
-            if do_sample:
-                # sampling-based generation
-                next_token = self._sample_next_token(next_token_logits, temperature, top_k, top_p)
-            else:
-                # greedy generation
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-            # update sequences
-            decoder_tokens = torch.cat([decoder_tokens, next_token], dim=-1)
-
-            # check for finished sequences
-            if eos_token_id is not None:
-                finished = finished | (next_token.squeeze(-1) == eos_token_id)
-                if finished.all():
-                    break
-
-        return decoder_tokens
-
-    def _beam_search_generate(
-        self,
-        encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        decoder_start_token_id: int,
-        decoder_input_ids: Optional[torch.Tensor],
-        max_length: int,
-        min_length: int,
-        num_beams: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        repetition_penalty: float,
-        no_repeat_ngram_size: int,
-        eos_token_id: Optional[int],
-        pad_token_id: Optional[int],
-        length_penalty: float,
-        early_stopping: bool,
-        num_return_sequences: int,
-        batch_size: int,
-        device: torch.device,
-        use_cache: bool = True,
-        use_fixed_length_generation: bool = False,
-    ) -> torch.Tensor:
-        """Beam search generation with KV caching."""
-        # handle fixed-length generation compatibility
-        if use_fixed_length_generation:
-            # fixed-length generation and kv caching are incompatible in beam search
-            if use_cache:
-                logger.warning("Fixed-length generation is incompatible with KV caching in beam search. Disabling cache.")
-                use_cache = False
-
-        # Expand inputs for beam search
-        beam_batch_size = batch_size * num_beams
-
-        # Expand encoder outputs
-        encoder_hidden_states = encoder_hidden_states.unsqueeze(1).repeat(1, num_beams, 1, 1)
-        encoder_hidden_states = encoder_hidden_states.view(beam_batch_size, encoder_hidden_states.shape[2], encoder_hidden_states.shape[3])
-
-        encoder_attention_mask = encoder_attention_mask.unsqueeze(1).repeat(1, num_beams, 1)
-        encoder_attention_mask = encoder_attention_mask.view(beam_batch_size, encoder_attention_mask.shape[2])
-
-        # Initialize beams
-        if decoder_input_ids is None:
-            decoder_input_ids = torch.full((beam_batch_size, 1), decoder_start_token_id, device=device, dtype=torch.long)
-        else:
-            # replicate decoder prompt for all beams
-            decoder_input_ids = decoder_input_ids.unsqueeze(1).repeat(1, num_beams, 1)
-            decoder_input_ids = decoder_input_ids.view(beam_batch_size, -1)
-
-        # Initialize beam scores
-        beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=device)
-        beam_scores[:, 1:] = -float('inf')  # Only first beam is active initially
-        beam_scores = beam_scores.view(-1)
-
-        # Track finished beams
-        finished_sequences = []
-        finished_scores = []
-
-        # Initialize KV cache
-        past_key_values = None
-
-        # determine initial prompt length for proper loop handling
-        initial_length = decoder_input_ids.shape[1]
-
-        # pre-allocate buffer for fixed-length generation
-        if use_fixed_length_generation:
-            buffer_size = max_length
-        else:
-            buffer_size = max_length
-
-        for step in range(max_length - initial_length):
-            current_length = decoder_input_ids.shape[1]
-
-            # Prepare input for this step based on generation mode
-            if use_fixed_length_generation:
-                # when using fixed-length generation, always pass the full buffer
-                # pad decoder tokens to buffer size
-                if current_length < buffer_size:
-                    padding_length = buffer_size - current_length
-                    padding = torch.full((beam_batch_size, padding_length), pad_token_id, dtype=decoder_input_ids.dtype, device=device)
-                    input_ids_step = torch.cat([decoder_input_ids, padding], dim=1)
-                else:
-                    input_ids_step = decoder_input_ids[:, :buffer_size]
-                # create attention mask for valid positions only
-                positions = torch.arange(buffer_size, device=device).unsqueeze(0)
-                decoder_attention_mask = (positions < current_length).long()
-            elif past_key_values is not None and use_cache:
-                input_ids_step = decoder_input_ids[:, -1:]
-                decoder_attention_mask = torch.ones_like(input_ids_step)
-            else:
-                input_ids_step = decoder_input_ids
-                decoder_attention_mask = decoder_input_ids.ne(pad_token_id) if pad_token_id is not None else torch.ones_like(decoder_input_ids)
-
-            # Compute jamo/char input_ids if needed
-            decoder_jamo_input_ids = None
-            decoder_char_input_ids = None
-            if self.config.jamo_subwords and hasattr(self.decoder, "jbu") and self.decoder.jbu is not None:
-                decoder_jamo_input_ids = self.decoder.jbu[input_ids_step].long()
-            if self.config.char_subwords and hasattr(self.decoder, "cbu") and self.decoder.cbu is not None:
-                decoder_char_input_ids = self.decoder.cbu[input_ids_step].long()
-
-            # forward pass with KV caching
-            outputs = self.decoder(
-                input_ids=input_ids_step,
-                jamo_input_ids=decoder_jamo_input_ids,
-                char_input_ids=decoder_char_input_ids,
-                attention_mask=decoder_attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                return_dict=True,
-            )
-
-            # Update KV cache
-            if use_cache:
-                past_key_values = outputs.past_key_values
-
-            # get logits for next token prediction
-            hidden_states = outputs.last_hidden_state
-            next_token_logits = self.lm_head(hidden_states[:, -1, :])
-
-            # apply repetition penalty
-            if repetition_penalty != 1.0:
-                next_token_logits = self._apply_repetition_penalty(
-                    next_token_logits, decoder_input_ids, repetition_penalty
-                )
-
-            # apply no_repeat_ngram constraint
-            if no_repeat_ngram_size > 0 and current_length > no_repeat_ngram_size:
-                next_token_logits = self._apply_no_repeat_ngram(
-                    next_token_logits, decoder_input_ids, no_repeat_ngram_size, current_length
-                )
-
-            # apply min_length constraint
-            if current_length < min_length and eos_token_id is not None:
-                next_token_logits[:, eos_token_id] = -float('inf')
-
-            # Apply temperature
-            if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-
-            # Calculate scores for all possible next tokens
-            next_scores = F.log_softmax(next_token_logits, dim=-1)
-
-            # Apply length penalty
-            if length_penalty != 1.0:
-                next_scores = next_scores / (decoder_input_ids.shape[1] ** length_penalty)
-
-            # Add to beam scores
-            next_scores = next_scores + beam_scores.unsqueeze(1)
-
-            # Reshape for beam selection
-            next_scores = next_scores.view(batch_size, num_beams * next_token_logits.shape[-1])
-
-            # Select top beams
-            next_scores, next_tokens = torch.topk(next_scores, 2 * num_beams, dim=1, largest=True, sorted=True)
-
-            next_beam_scores = []
-            next_beam_tokens = []
-            next_beam_indices = []
-
-            for batch_idx in range(batch_size):
-                beam_id = 0
-                for rank in range(2 * num_beams):
-                    if beam_id >= num_beams:
-                        break
-
-                    token_id = next_tokens[batch_idx, rank] % next_token_logits.shape[-1]
-                    beam_idx = next_tokens[batch_idx, rank] // next_token_logits.shape[-1]
-
-                    # Check if this beam has finished
-                    if eos_token_id is not None and token_id.item() == eos_token_id:
-                        if decoder_input_ids.shape[1] >= min_length:
-                            # Store finished sequence
-                            finished_sequences.append(decoder_input_ids[batch_idx * num_beams + beam_idx].clone())
-                            finished_scores.append(next_scores[batch_idx, rank].item())
-
-                            # Check early stopping
-                            if early_stopping and len(finished_sequences) >= num_beams:
-                                break
-                        continue
-
-                    next_beam_scores.append(next_scores[batch_idx, rank])
-                    next_beam_tokens.append(token_id)
-                    next_beam_indices.append(batch_idx * num_beams + beam_idx)
-                    beam_id += 1
-
-            # Check if we have enough finished sequences
-            if early_stopping and len(finished_sequences) >= batch_size * num_beams:
-                break
-
-            # Update beam state
-            if len(next_beam_scores) > 0:
-                beam_scores = torch.stack(next_beam_scores)
-                beam_tokens = torch.stack(next_beam_tokens).unsqueeze(1)
-                beam_indices = torch.tensor(next_beam_indices, device=device)
-
-                # Reorder decoder input ids
-                decoder_input_ids = decoder_input_ids[beam_indices]
-                decoder_input_ids = torch.cat([decoder_input_ids, beam_tokens], dim=-1)
-
-                # Reorder KV cache
-                if use_cache and past_key_values is not None:
-                    past_key_values = self._reorder_cache(past_key_values, beam_indices)
-            else:
-                break
-
-        # Return best sequences
-        if len(finished_sequences) > 0:
-            # Sort by scores and return top sequences
-            sorted_indices = sorted(range(len(finished_scores)), key=lambda i: finished_scores[i], reverse=True)
-            best_sequences = [finished_sequences[i] for i in sorted_indices[:num_return_sequences]]
-
-            # Pad sequences to same length
-            max_len = max(seq.shape[0] for seq in best_sequences)
-            padded_sequences = []
-            for seq in best_sequences:
-                if seq.shape[0] < max_len:
-                    padding = torch.full((max_len - seq.shape[0],), pad_token_id if pad_token_id is not None else 0,
-                                        device=device, dtype=torch.long)
-                    seq = torch.cat([seq, padding])
-                padded_sequences.append(seq)
-
-            return torch.stack(padded_sequences)
-        else:
-            # Return current best beams if no sequences finished
-            return decoder_input_ids[:num_return_sequences]
-
-    def _simple_generate(
-        self,
-        encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        decoder_start_token_id: int,
-        max_length: int,
-        min_length: int,
-        do_sample: bool,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        repetition_penalty: float,
-        eos_token_id: Optional[int],
-        pad_token_id: Optional[int],
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Simple generation without kv caching (kept for compatibility)."""
-        return self._generate_with_cache(
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            decoder_start_token_id=decoder_start_token_id,
-            max_length=max_length,
-            min_length=min_length,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            batch_size=batch_size,
-            device=device,
-            use_cache=False,  # Disable caching for simple generation
-        )
-
-
-    def _sample_next_token(
-        self,
-        logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float
-    ) -> torch.Tensor:
-        """Sample next token using temperature, top-k, and top-p."""
-        # Apply temperature
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        # Apply top-k filtering
-        if top_k > 0:
-            top_k_logits, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
-            logits_filtered = torch.full_like(logits, float('-inf'))
-            logits_filtered.scatter_(-1, top_k_indices, top_k_logits)
-            logits = logits_filtered
-
-        # Apply top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            # Create mask for indices to remove
-            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-        # Sample from the filtered distribution
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-
-        return next_token
-
-    def _apply_repetition_penalty(
-        self,
-        logits: torch.Tensor,
-        previous_tokens: torch.Tensor,
-        penalty: float
-    ) -> torch.Tensor:
-        """Apply repetition penalty to logits."""
-        if penalty == 1.0:
-            return logits
-
-        # Create a mask for tokens that have appeared before
-        batch_size, vocab_size = logits.shape
-        for batch_idx in range(batch_size):
-            for token in previous_tokens[batch_idx]:
-                if token < vocab_size:
-                    if logits[batch_idx, token] < 0:
-                        logits[batch_idx, token] *= penalty
-                    else:
-                        logits[batch_idx, token] /= penalty
-
-        return logits
-
-    def _apply_no_repeat_ngram(
-        self,
-        logits: torch.Tensor,
-        previous_tokens: torch.Tensor,
-        ngram_size: int,
-        cur_len: int
-    ) -> torch.Tensor:
-        """Apply no-repeat-ngram constraint."""
-        if ngram_size <= 0:
-            return logits
-
-        batch_size = previous_tokens.shape[0]
-
-        for batch_idx in range(batch_size):
-            # get the sequence for this batch
-            seq = previous_tokens[batch_idx]
-
-            # check if we have enough tokens for ngram comparison
-            if cur_len < ngram_size:
-                continue
-
-            # get the last (ngram_size - 1) tokens
-            ngram_prefix = tuple(seq[cur_len - ngram_size + 1:cur_len].tolist())
-
-            # look for this prefix in the previous sequence
-            for i in range(cur_len - ngram_size):
-                prev_ngram = tuple(seq[i:i + ngram_size - 1].tolist())
-
-                if prev_ngram == ngram_prefix:
-                    # we found a match, ban the next token that would complete this ngram
-                    next_token = seq[i + ngram_size - 1]
-                    if next_token < logits.shape[-1]:
-                        logits[batch_idx, next_token] = -float('inf')
-
-        return logits
+        return super().generate(*args, **kwargs)
 
 
 class Han2HanClassificationHead(nn.Module):

@@ -2,17 +2,6 @@
 # coding: utf-8
 
 import logging
-import sys
-# logging setup before any other imports
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    stream=sys.stdout,
-    force=True
-)
-# suppress absl logging
-from absl import logging as absl_logging
-absl_logging.set_verbosity(absl_logging.WARNING)
 
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List
@@ -54,6 +43,16 @@ class Han2HanConfig(PretrainedConfig):
                 output[field] = getattr(self, field)
 
         return output
+
+    def get_text_config(self, decoder=None, encoder=None):
+        """Return this config for either side of the model.
+
+        The encoder and decoder share one flat config. The base implementation
+        treats flat encoder-decoder configs as legacy and strips the `decoder_`
+        prefix from every key (`decoder_nlayer` -> `nlayer`), which leaves
+        `num_hidden_layers` unresolvable when `generate()` sizes its KV cache.
+        """
+        return self
 
     def __init__(
         self,
@@ -475,7 +474,11 @@ class Han2HanConfig(PretrainedConfig):
 
     def make_kernel_init(self, dtype=None):
         """Create kernel initializer based on config."""
-        from flax import nnx
+        # try block keeps transformers' remote-code import check from requiring flax
+        try:
+            from flax import nnx
+        except ImportError:
+            raise
         kwargs = {'dtype': dtype} if dtype is not None else {}
         if self.kernel_init_type == 'variance_scaling':
             return nnx.initializers.variance_scaling(
@@ -488,7 +491,11 @@ class Han2HanConfig(PretrainedConfig):
 
         V1 behavior is normal(stddev=initializer_range); current default is zeros.
         """
-        from flax import nnx
+        # try block keeps transformers' remote-code import check from requiring flax
+        try:
+            from flax import nnx
+        except ImportError:
+            raise
         if self.init_biases_normal:
             return nnx.initializers.normal(stddev=self.initializer_range)
         return nnx.initializers.zeros_init()

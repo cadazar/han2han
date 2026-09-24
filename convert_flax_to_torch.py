@@ -941,6 +941,14 @@ def process_checkpoints(ckpt_dir, output_dir, tokenizer_path="han2han_v2_tokeniz
     print("cleaned up the copied checkpoints dir")
 
 if __name__ == "__main__":
+    import logging
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        stream=sys.stdout,
+        force=True,
+    )
     import argparse
 
     # first let's argparse requiring the base ckpt dir. we'll just do one at a time.
