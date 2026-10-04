@@ -28,6 +28,10 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 DEFAULT_SPM = os.path.join(REPO_ROOT, "han2han_v2_tokenizer", "spiece.model")
 DEFAULT_TEMPLATE = os.path.join(REPO_ROOT, "han2han_v2_tokenizer", "chat_template.jinja")
 
+# SentencePiece drops every leading space when it decodes (a lone whitespace piece before a
+# word-initial one gives two); the Strip decoder takes a count, so this is an upper bound
+LEADING_SPACES = 4096
+
 # SentencePiece piece types
 UNKNOWN, CONTROL, USER_DEFINED = 2, 3, 4
 
@@ -59,7 +63,7 @@ def build_tokenizer(spm_path: str) -> Tokenizer:
         decoders.Replace("▁", " "),
         decoders.ByteFallback(),
         decoders.Fuse(),
-        decoders.Strip(" ", 1, 0),
+        decoders.Strip(" ", LEADING_SPACES, 0),
     ])
     specials = [piece.piece for piece in proto.pieces if piece.type in (UNKNOWN, CONTROL, USER_DEFINED)]
     tokenizer.add_special_tokens([AddedToken(piece, normalized=False, special=True) for piece in specials])
