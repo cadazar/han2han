@@ -1346,6 +1346,31 @@ class Han2HanPreTrainedModel(PreTrainedModel):
         return dummy_inputs
 
 
+def entry_pool_torch(table, ids, *, mode='legacy', pad_bias_slots=0):
+    """modeling_han2han_flax.entry_pool over full-width slot ids: pool ``table`` rows over the last axis of
+    ``ids`` ([.., n_slots], bucket 0 = pad), accumulating in float32 and returning the table's dtype.
+
+    'legacy' sums every slot (pad slots add the bucket-0 row); 'masked_sum' / 'masked_mean' sum / average the
+    non-pad slots only and add ``pad_bias_slots`` copies of the bucket-0 row. The ids must carry the lookup
+    table's full width: a trimmed table would need the trimmed pad columns added back in legacy mode.
+    """
+    if mode == 'legacy' and pad_bias_slots:
+        raise ValueError("pad_bias_slots only applies to the masked entry pool modes.")
+    gathered = F.embedding(ids, table)
+    if mode == 'legacy':
+        pooled = gathered.sum(dim=-2, dtype=torch.float32)
+    elif mode in ('masked_sum', 'masked_mean'):
+        valid = (ids != 0).unsqueeze(-1)
+        pooled = (gathered * valid).sum(dim=-2, dtype=torch.float32)
+        if mode == 'masked_mean':
+            pooled = pooled / valid.sum(dim=-2, dtype=torch.float32).clamp(min=1.0)
+        if pad_bias_slots:
+            pooled = pooled + pad_bias_slots * table[0].float()
+    else:
+        raise ValueError(f"unknown entry pool mode {mode!r}")
+    return pooled.to(table.dtype)
+
+
 class Han2HanModule(Han2HanPreTrainedModel):
     """Base module for encoder/decoder, matching FlaxHan2HanModule."""
     def __init__(self, config: Han2HanConfig, is_encoder: bool = False):
@@ -1361,6 +1386,14 @@ class Han2HanModule(Han2HanPreTrainedModel):
         self.wje = None
         self.wce = None
         if config.jamo_subwords or config.char_subwords:
+            # the lookup buffers keep their full width, so an entry_slot_width trim
+            # (exact in every mode) is never applied here
+            self.entry_pool_mode = getattr(config, 'entry_pool_mode', 'legacy')
+            self.entry_pad_bias_slots = getattr(config, 'entry_pad_bias_slots', 0)
+            if self.entry_pool_mode not in ('legacy', 'masked_sum', 'masked_mean'):
+                raise ValueError(f"unknown entry_pool_mode {self.entry_pool_mode!r}")
+            if self.entry_pad_bias_slots and self.entry_pool_mode == 'legacy':
+                raise ValueError("entry_pad_bias_slots only applies to the masked entry pool modes")
             self.subword_proj = FlaxLinear(
                 in_features=subword_embed_dim,
                 out_features=config.d_model,
@@ -1458,8 +1491,8 @@ class Han2HanModule(Han2HanPreTrainedModel):
                     if not hasattr(self, 'jbu'):
                         raise ValueError("`jamo_input_ids` not provided and `jbu` lookup buffer is missing.")
                     jamo_input_ids = self.jbu[input_ids.long()].long()
-                jamo_embeds = self.wje(jamo_input_ids)
-                jamo_embeds = jamo_embeds.sum(dim=-2)  # pooling over ngrams
+                jamo_embeds = entry_pool_torch(self.wje.weight, jamo_input_ids, mode=self.entry_pool_mode,
+                                               pad_bias_slots=self.entry_pad_bias_slots)
                 subword_features = subword_features + jamo_embeds * wje_keep
 
             if self.wce is not None:
@@ -1467,8 +1500,8 @@ class Han2HanModule(Han2HanPreTrainedModel):
                     if not hasattr(self, 'cbu'):
                         raise ValueError("`char_input_ids` not provided and `cbu` lookup buffer is missing.")
                     char_input_ids = self.cbu[input_ids.long()].long()
-                char_embeds = self.wce(char_input_ids)
-                char_embeds = char_embeds.sum(dim=-2)
+                char_embeds = entry_pool_torch(self.wce.weight, char_input_ids, mode=self.entry_pool_mode,
+                                               pad_bias_slots=self.entry_pad_bias_slots)
                 subword_features = subword_features + char_embeds * wce_keep
 
             scale_factor = (2.0 / max(num_active, 1.0)) if num_active > 0 else 1.0
