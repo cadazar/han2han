@@ -195,12 +195,20 @@ reply, as `pipeline("text-generation")` and `transformers serve` expect:
 
 ```bash
 transformers serve --trust-remote-code
-transformers chat cadazar/han2han-it
+transformers chat cadazar/han2han-it --system-prompt "한자를 한글로 전사하시오:"
 ```
+
+The instruction tuning put each task prompt (`task_prompts.py`) in the system
+slot and the text alone in the user turn (`chat_sft_collator.py`), and the
+checkpoint expects that layout: with the instruction written into the user turn,
+Hangul to Hanja restoration returns the Hangul input unchanged. The model card
+has examples of both directions.
 
 ## Demos
 
 - `hanja_transcription_demo.ipynb` -- bidirectional Hanja<->Hangul transcription.
+  It writes the instruction into the user turn, not the system slot, so its
+  Hangul to Hanja outputs understate the checkpoint; see the model card.
 - `umap_comparisons.ipynb` -- the script-invariance UMAP visualizations from the
   paper (Han2Han vs. T5Gemma 2, before and after applying the recipe).
 
