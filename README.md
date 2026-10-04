@@ -207,8 +207,9 @@ has examples of both directions.
 ## Demos
 
 - `hanja_transcription_demo.ipynb` -- bidirectional Hanja<->Hangul transcription.
-  It writes the instruction into the user turn, not the system slot, so its
-  Hangul to Hanja outputs understate the checkpoint; see the model card.
+  Sections 4 to 9 write the instruction into the user turn, not the system
+  slot, so their Hangul to Hanja outputs understate the checkpoint; section 10
+  (added October 2026) runs the trained layout.
 - `umap_comparisons.ipynb` -- the script-invariance UMAP visualizations from the
   paper (Han2Han vs. T5Gemma 2, before and after applying the recipe).
 
