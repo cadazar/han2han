@@ -1,0 +1,24 @@
+{%- if messages and messages[0]['role'] == 'system' -%}
+    {%- if messages[0]['content'] is string -%}
+        {{- '<|system|>' + messages[0]['content'] -}}
+    {%- else -%}
+        {{- '<|system|>' + messages[0]['content'] | selectattr('type', 'equalto', 'text') | map(attribute='text') | join('') -}}
+    {%- endif -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- if message['role'] not in ['user', 'assistant'] -%}
+        {{- raise_exception('Han2Han chat supports a leading system message, then user and assistant turns; got role ' + message['role']) -}}
+    {%- endif -%}
+    {%- if message['content'] is string -%}
+        {%- set content = message['content'] -%}
+    {%- else -%}
+        {%- set content = message['content'] | selectattr('type', 'equalto', 'text') | map(attribute='text') | join('') -%}
+    {%- endif -%}
+    {{- '<|' + message['role'] + '|>' + content + '<|end_of_turn|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|think|>' if enable_thinking is defined and enable_thinking else '<|assistant|>' -}}
+{%- endif -%}

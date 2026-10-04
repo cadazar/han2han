@@ -22,9 +22,11 @@ try:
         AutoModelForQuestionAnswering,
         AutoModelForMultipleChoice,
         AutoModelForSeq2SeqLM,
+        AutoModelForCausalLM,
     )
     from modeling_han2han_pytorch import (
         Han2Han,
+        Han2HanForCausalLM,
         Han2HanForSequenceClassification,
         Han2HanForTokenClassification,
         Han2HanForQuestionAnswering,
@@ -38,6 +40,7 @@ try:
     AutoModelForQuestionAnswering.register(Han2HanConfig, Han2HanForQuestionAnswering)
     AutoModelForMultipleChoice.register(Han2HanConfig, Han2HanForMultipleChoice)
     AutoModelForSeq2SeqLM.register(Han2HanConfig, Han2Han)
+    AutoModelForCausalLM.register(Han2HanConfig, Han2HanForCausalLM)
 
     print("Han2Han models and tokenizer registered with HuggingFace AutoClasses!")
 except ImportError:

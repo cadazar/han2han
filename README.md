@@ -186,6 +186,18 @@ The instruction-tuned checkpoint is on the Hugging Face Hub as
 through the `transformers` Auto classes with `trust_remote_code=True`; see the
 model card for a usage snippet.
 
+The Hub checkpoint also works with chat tooling. Its tokenizer is a
+`tokenizers`-library `tokenizer.json` with a chat template, built from the
+SentencePiece model by `scripts/build_hf_tokenizer.py`, and
+`Han2HanForCausalLM` (`AutoModelForCausalLM`) wraps the encoder-decoder so that
+`generate()` takes a rendered chat prompt and returns the prompt followed by the
+reply, as `pipeline("text-generation")` and `transformers serve` expect:
+
+```bash
+transformers serve --trust-remote-code
+transformers chat cadazar/han2han-it
+```
+
 ## Demos
 
 - `hanja_transcription_demo.ipynb` -- bidirectional Hanja<->Hangul transcription.

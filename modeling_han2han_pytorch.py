@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+import copy
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Dict
@@ -1715,7 +1716,14 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
         output_hidden_states: bool = False,
         output_sentence_embeddings: bool = False,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, Seq2SeqLMOutput]:
+
+        # generate() hands its tokenizer arguments (used for stop strings) on to forward
+        for name in ("tokenizer", "assistant_tokenizer"):
+            kwargs.pop(name, None)
+        if kwargs:
+            raise TypeError(f"Han2Han.forward() got unexpected keyword arguments: {sorted(kwargs)}")
 
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -1885,6 +1893,90 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
                 stacklevel=2,
             )
         return super().generate(*args, **kwargs)
+
+
+class Han2HanForCausalLM(Han2Han):
+    """Han2Han behind the interface chat tooling expects from a causal LM.
+
+    `generate()` takes a rendered chat prompt as one sequence and returns the prompt
+    followed by the continuation. The prompt is split at its last `<|end_of_turn|>`:
+    everything up to and including it is the encoder input, and what follows (the
+    generation prompt `<|assistant|>` or `<|think|>`, plus any prefilled reply) starts
+    the decoder. `forward()` is unchanged from `Han2Han` and stays encoder-decoder.
+    """
+
+    def generate(self, inputs=None, **kwargs):
+        input_ids = kwargs.pop("input_ids", inputs)
+        if input_ids is None:
+            raise ValueError("Han2HanForCausalLM.generate needs the chat prompt as `input_ids`.")
+        for name in ("decoder_input_ids", "encoder_outputs", "inputs_embeds"):
+            if kwargs.get(name) is not None:
+                raise ValueError(
+                    f"Han2HanForCausalLM.generate splits the prompt itself and does not accept `{name}`; "
+                    "use Han2Han (AutoModelForSeq2SeqLM) for encoder-decoder inputs."
+                )
+        pad_id = self.config.pad_token_id
+        end_of_turn_id = self.config.sft_eos_token_id
+        if end_of_turn_id is None:
+            raise ValueError("config.sft_eos_token_id is unset; this checkpoint has no chat format.")
+        attention_mask = kwargs.pop("attention_mask", None)
+        if attention_mask is None:
+            attention_mask = input_ids.ne(pad_id)
+
+        encoder_rows, prefixes = [], []
+        for row, mask in zip(input_ids, attention_mask.bool()):
+            row = row[mask]
+            ends = (row == end_of_turn_id).nonzero()
+            if ends.numel() == 0:
+                raise ValueError(
+                    "The prompt has no <|end_of_turn|>. Render it with the tokenizer's chat template "
+                    "(apply_chat_template(..., add_generation_prompt=True))."
+                )
+            cut = int(ends[-1]) + 1
+            if cut == row.numel():
+                raise ValueError(
+                    "The prompt ends at <|end_of_turn|> with no generation prompt after it; "
+                    "pass add_generation_prompt=True to apply_chat_template."
+                )
+            encoder_rows.append(row[:cut])
+            prefixes.append(row[cut:])
+        if len({p.numel() for p in prefixes}) != 1:
+            raise ValueError(
+                "Prompts in one batch must have decoder prefixes (the tokens after the last "
+                f"<|end_of_turn|>) of equal length; got lengths {[p.numel() for p in prefixes]}."
+            )
+        encoder_input_ids = nn.utils.rnn.pad_sequence(encoder_rows, batch_first=True, padding_value=pad_id)
+        encoder_attention_mask = nn.utils.rnn.pad_sequence(
+            [torch.ones_like(r) for r in encoder_rows], batch_first=True, padding_value=0
+        )
+        decoder_input_ids = torch.stack(prefixes)
+        start_ids = decoder_input_ids[:, 0].tolist()
+        decoder_start_token_id = start_ids[0] if len(set(start_ids)) == 1 else start_ids
+        if kwargs.get("generation_config") is not None:
+            kwargs["generation_config"] = copy.deepcopy(kwargs["generation_config"])
+            kwargs["generation_config"].decoder_start_token_id = decoder_start_token_id
+        else:
+            kwargs["decoder_start_token_id"] = decoder_start_token_id
+
+        outputs = super().generate(
+            input_ids=encoder_input_ids,
+            attention_mask=encoder_attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            **kwargs,
+        )
+        sequences = outputs if isinstance(outputs, torch.Tensor) else outputs.sequences
+        per_prompt, remainder = divmod(sequences.shape[0], input_ids.shape[0])
+        if remainder:
+            raise RuntimeError(
+                f"generate() returned {sequences.shape[0]} sequences for {input_ids.shape[0]} prompts."
+            )
+        full = torch.cat(
+            [input_ids.repeat_interleave(per_prompt, dim=0), sequences[:, decoder_input_ids.shape[1]:]], dim=1
+        )
+        if isinstance(outputs, torch.Tensor):
+            return full
+        outputs.sequences = full
+        return outputs
 
 
 class Han2HanClassificationHead(nn.Module):
