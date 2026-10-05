@@ -1066,18 +1066,16 @@ class Han2HanPreTrainedModel(PreTrainedModel):
                 )
 
             if safetensors_path is not None and os.path.exists(safetensors_path):
+                # the base class has already placed the weights (device_map, .to()), so each
+                # table goes to the device of the embedding it is indexed beside
                 with safe_open(safetensors_path, framework="pt") as f:
-                    # Load encoder buffers
-                    if "encoder.jbu" in f.keys() and not hasattr(base_model.encoder, 'jbu'):
-                        base_model.encoder.register_buffer('jbu', f.get_tensor("encoder.jbu"))
-                    if "encoder.cbu" in f.keys() and not hasattr(base_model.encoder, 'cbu'):
-                        base_model.encoder.register_buffer('cbu', f.get_tensor("encoder.cbu"))
-
-                    # Load decoder buffers
-                    if "decoder.jbu" in f.keys() and not hasattr(base_model.decoder, 'jbu'):
-                        base_model.decoder.register_buffer('jbu', f.get_tensor("decoder.jbu"))
-                    if "decoder.cbu" in f.keys() and not hasattr(base_model.decoder, 'cbu'):
-                        base_model.decoder.register_buffer('cbu', f.get_tensor("decoder.cbu"))
+                    for module, module_name in ((base_model.encoder, "encoder"), (base_model.decoder, "decoder")):
+                        for table_name in ("jbu", "cbu"):
+                            key = f"{module_name}.{table_name}"
+                            if key in f.keys() and not hasattr(module, table_name):
+                                module.register_buffer(
+                                    table_name, f.get_tensor(key).to(module.wte.weight.device)
+                                )
 
         if loading_info is not None:
             return model, loading_info
@@ -1581,6 +1579,21 @@ class Han2Han(Han2HanPreTrainedModel, GenerationMixin):
         if jamo_buckets is not None:
             self.encoder.jbu = self.decoder.jbu = torch.tensor(jamo_buckets.copy())
             self.register_buffer('jbu', self.encoder.jbu)
+
+    @property
+    def init_continuous_batching(self):
+        """Continuous batching is not available for this model.
+
+        `GenerationMixin` offers it to every model, but it drives a decoder-only forward
+        pass over one packed sequence with a paged KV cache. Han2Han is an encoder-decoder
+        with its own attention, so the attribute is withheld: `transformers serve
+        --continuous-batching` then falls back to sequential generation with a warning
+        instead of failing inside `forward()`.
+        """
+        raise AttributeError(
+            f"{type(self).__name__} does not support continuous batching (encoder-decoder model); "
+            "use generate()."
+        )
 
     def tie_weights(self, missing_keys=None, *args, **kwargs):
         """Override HF's generic tie_weights.
