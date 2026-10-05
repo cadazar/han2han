@@ -187,7 +187,7 @@ usage snippets.
 
 | Repo | Stage |
 | --- | --- |
-| [`cadazar/han2han-base`](https://huggingface.co/cadazar/han2han-base) | pre-training (35B tokens); the uniform average of the last five checkpoints, which is what the instruction tuning started from |
+| [`cadazar/han2han-pt`](https://huggingface.co/cadazar/han2han-pt) | pre-training (35B tokens); the uniform average of the last five checkpoints, which is what the instruction tuning started from |
 | [`cadazar/han2han-it`](https://huggingface.co/cadazar/han2han-it) | instruction tuning |
 | [`cadazar/han2han-rl`](https://huggingface.co/cadazar/han2han-rl) | reinforcement learning on Hanja-Hangul transcription, from `han2han-it` |
 

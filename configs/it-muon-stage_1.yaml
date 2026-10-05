@@ -3,27 +3,32 @@
 # (<|system|>, <|user|>, <|assistant|>, <|end_of_turn|>, <|think|> boundaries).
 # Requires a tokenizer regenerated with <|think|> via
 # han2han_v2_tokenizer/prepare_multilingual_tokenizer.py.
+#
+# This is the recipe of the instruction tuning behind cadazar/han2han-it at its
+# emnlp2026 revision (step 43153). The file the run was launched from was not
+# kept; the values here are the ones the run recorded at launch (2026-05-24).
 
 # parallelism
 parallelism_strategy: data_parallel
 
 # model paths
-model_path: gs://han2han-europe-west4/han2han-ul2-base-1/pt_ropeFix/to_150b/checkpoints
+model_path: gs://han2han-europe-west4/han2han-ul2-base-1/pt_ropeFix/checkpoints
 tokenizer_path: han2han_v2_tokenizer
-output_dir: gs://han2han-europe-west4/han2han-ul2-base-1/IT_CoT_stage_1-frozen_wje_wce-150B-CL_SS
+output_dir: gs://han2han-europe-west4/han2han-ul2-base-1/IT_CoT_stage_1-CL_SS
 
-# for checkpoint averaging
-# average_last_n: 5
+# for checkpoint averaging: the run started from the uniform average of the last
+# five pre-training checkpoints (steps 6347, 6441, 6536, 6630, 6725), which is
+# what cadazar/han2han-pt holds
+average_last_n: 5
 average_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
 lookahead_alpha: 0.0
-average_steps: [25037, 26089, 26950, 28001, 28766]
 
 # data config
 data_dir: task_data
 data_bucket: gs://han2han-europe-west4
 sft_tasks: instruction_following,cot_reasoning,transcription_articles,summarization
 sft_sampling_strategy: capped
-sft_sampling_cap_multiplier: 10.0
+sft_sampling_cap_multiplier: 3.0
 max_encoder_length: 2048
 max_decoder_length: 2048
 enable_packing: true
@@ -31,9 +36,9 @@ packing_efficiency_threshold: 0.9
 packed_buffer_size: 32
 
 # training hyperparameters
-max_tokens: 2_000_000_000
+max_tokens: 1_500_000_000
 batch_size: 8
-learning_rate: 2.66e-5
+learning_rate: 1e-5
 warmup_ratio: 0.1
 constant_ratio: 0.7
 lr_schedule: constant
@@ -42,7 +47,7 @@ lr_cooldown_type: sqrt
 min_lr_ratio: 0.01
 gradient_accumulation_steps: 2
 remat_policy: none
-freeze_pretrained_params: wje,wce
+freeze_pretrained_params: false
 freeze_embeddings: null
 
 # quantization
@@ -63,12 +68,12 @@ muon_hybrid_ns: false
 muon_adam_wd_ratio: 0.1
 muon_adam_wd_skip_1d: true
 muon_gamma: 0.18
-weight_decay: 0.01
-embedding_weight_decay: 0.01
-lm_head_weight_decay: 0.01
-mlp_weight_decay: 0.01
-norm_weight_decay: 0.01
-bias_weight_decay: 0.01
+weight_decay: 0.1
+embedding_weight_decay: 0.0
+lm_head_weight_decay: 0.0
+mlp_weight_decay: 0.0
+norm_weight_decay: 0.0
+bias_weight_decay: 0.0
 
 # scheduled sampling
 use_scheduled_sampling: true
@@ -85,25 +90,25 @@ cl_margin: 0.01
 cl_temperature: 1.0
 
 # evaluation / saving
-eval_every_tokens: 200_000_000
+eval_every_tokens: 300_000_000
 save_every_tokens: 50_000_000
-skip_restore: false
+skip_restore: true
 restore_step: null
 save_best_metric: null
 save_best_mode: max
 eval_batch_size: 32
 max_eval_samples: 1000
-eval_tasks: ""
+eval_tasks: transcription_articles,summarization
 eval_with_cot: false
 
 # dropout/label smoothing
-label_smoothing: 0.05
-attndrop: 0.05
-resdrop: 0.05
-embddrop: 0.05
-cross_attn_pdrop: 0.05
+label_smoothing: 0.1
+attndrop: 0.1
+resdrop: 0.1
+embddrop: 0.1
+cross_attn_pdrop: 0.1
 embedding_dropout_rate: 0.0
-layerdrop: 0.05
+layerdrop: 0.0
 
 # prompts (these become the <|system|> content under the chat collator)
 use_task_prompts: true
@@ -117,4 +122,4 @@ dtype: bfloat16
 # wandb
 use_wandb: true
 wandb_project: han2han-sft
-wandb_run_name: IT-CoT-stage_1-frozenWjeWce-CLSS-150B
+wandb_run_name: IT-CoT-stage_1-CL+SS
