@@ -181,12 +181,24 @@ python compare_ppl_flax_torch.py --flax_ckpt /path/to/flax/checkpoints \
     --pt_dir converted/han2han-base --data corpus.parquet --n 32 --max_length 256
 ```
 
-The instruction-tuned checkpoint is on the Hugging Face Hub as
-[`cadazar/han2han-it`](https://huggingface.co/cadazar/han2han-it). It loads
-through the `transformers` Auto classes with `trust_remote_code=True`; see the
-model card for a usage snippet.
+Three checkpoints are on the Hugging Face Hub. Each loads through the
+`transformers` Auto classes with `trust_remote_code=True`; the model cards have
+usage snippets.
 
-The Hub checkpoint also works with chat tooling. Its tokenizer is a
+| Repo | Stage |
+| --- | --- |
+| [`cadazar/han2han-base`](https://huggingface.co/cadazar/han2han-base) | pre-training (35B tokens); the uniform average of the last five checkpoints, which is what the instruction tuning started from |
+| [`cadazar/han2han-it`](https://huggingface.co/cadazar/han2han-it) | instruction tuning |
+| [`cadazar/han2han-rl`](https://huggingface.co/cadazar/han2han-rl) | reinforcement learning on Hanja-Hangul transcription, from `han2han-it` |
+
+`han2han-it` has two revisions. `emnlp2026` is the checkpoint behind the paper
+(step 43153). It was trained with its weights in bf16, where the updates to the
+embedding rows of the chat tokens were rounded away, so it did not learn to end
+its turns. `main` continues the same instruction tuning for 30M tokens in fp32
+and does end them. Pass `revision="emnlp2026"` to `from_pretrained` to
+reproduce the paper.
+
+The `han2han-it` and `han2han-rl` checkpoints also work with chat tooling. The tokenizer is a
 `tokenizers`-library `tokenizer.json` with a chat template, built from the
 SentencePiece model by `scripts/build_hf_tokenizer.py`, and
 `Han2HanForCausalLM` (`AutoModelForCausalLM`) wraps the encoder-decoder so that
