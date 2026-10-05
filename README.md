@@ -189,7 +189,7 @@ usage snippets.
 | --- | --- |
 | [`cadazar/han2han-pt`](https://huggingface.co/cadazar/han2han-pt) | pre-training (35B tokens); the uniform average of the last five checkpoints, which is what the instruction tuning started from |
 | [`cadazar/han2han-it`](https://huggingface.co/cadazar/han2han-it) | instruction tuning |
-| [`cadazar/han2han-rl`](https://huggingface.co/cadazar/han2han-rl) | reinforcement learning on Hanja-Hangul transcription, from `han2han-it` |
+| [`cadazar/han2han-rl`](https://huggingface.co/cadazar/han2han-rl) | reinforcement learning on transcription in both directions (Hangul to Hanja and Hanja to Hangul), from `han2han-it` |
 
 `han2han-it` has two revisions. `emnlp2026` is the checkpoint behind the paper
 (step 43153). It was trained with its weights in bf16, where the updates to the
